@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 每日选股 - 策略组合包
-包含三个策略：
+包含四个策略：
   1. Fstop3_pt5 v10：RSI<18 + BB触底 + 放量1.5x + 弱市50%
   2. BB1.00：RSI<20 + BB<=1.00 + 弱市70% + 7天持有
-  3. BB0.99：RSI<20 + BB<=0.99 + 弱市70% + 7天持有
+  4. BB1.02+KDJ Oversold
+  4. BB0.99：RSI<20 + BB<=0.99 + 弱市70% + 7天持有
 用法: python3 daily_pick_combined.py [--date 2026-04-02] [--push]
 """
 import sqlite3, json, subprocess, os, argparse, time, requests
@@ -14,6 +15,7 @@ from collections import defaultdict
 parser = argparse.ArgumentParser()
 parser.add_argument('--date', default=None)
 parser.add_argument('--push', action='store_true')
+parser.add_argument('--also-group', action='store_true', help='同时推送到群')
 parser.add_argument('--wait', action='store_true')
 args = parser.parse_args()
 
@@ -126,6 +128,50 @@ def vol_ratio(sym):
     if len(vols) < 2: return 0
     return vols[0] / (sum(vols)/len(vols)) if sum(vols)>0 else 0
 
+def recalc_kdj_if_needed(db, date):
+    """若当日KDJ全为空，则批量补算"""
+    c = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND kdj_k IS NOT NULL", (date,)).fetchone()[0]
+    total = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (date,)).fetchone()[0]
+    if c >= total * 0.8:  # 已有80%以上，跳过
+        return
+    import statistics
+    def calc_kdj(symbol, trade_date, n=9):
+        rows = db.execute("""
+            SELECT close, high, low FROM kline_daily 
+            WHERE symbol=? AND trade_date<=?
+            ORDER BY trade_date DESC LIMIT ?
+        """, (symbol, trade_date, n+20)).fetchall()
+        if len(rows) < n + 1:
+            return None, None, None
+        rsv_data = []
+        for i in range(n):
+            close = rows[n-1-i][0]
+            high = max(rows[n-1-i-j][1] for j in range(n) if n-1-i-j >= 0)
+            low = min(rows[n-1-i-j][2] for j in range(n) if n-1-i-j >= 0)
+            rsv = 50 if high == low else (close - low) / (high - low) * 100
+            rsv_data.append(rsv)
+        k_prev, d_prev = 50.0, 50.0
+        for rsv in rsv_data:
+            k_prev = (2/3) * k_prev + (1/3) * rsv
+            d_prev = (2/3) * d_prev + (1/3) * k_prev
+        j = 3 * k_prev - 2 * d_prev
+        return round(k_prev, 2), round(d_prev, 2), round(j, 2)
+    missing = [r[0] for r in db.execute(
+        "SELECT symbol FROM kline_daily WHERE trade_date=? AND kdj_k IS NULL", (date,)).fetchall()]
+    updated = 0
+    for sym in missing:
+        k, d, j = calc_kdj(sym, date)
+        if k is not None:
+            db.execute("UPDATE kline_daily SET kdj_k=?, kdj_d=?, kdj_j=? WHERE symbol=? AND trade_date=?", 
+                        (k, d, j, sym, date))
+            updated += 1
+    db.commit()
+    print(f"  KDJ补算: {updated}/{len(missing)} 只")
+
+# 先补算KDJ（如需要）
+print("检查KDJ数据...")
+recalc_kdj_if_needed(db, latest)
+
 def run_strategy(name, rsi_thresh, bb_mult, weak_thresh, vol_required, topn, market_ok):
     """运行单个策略，返回候选列表"""
     cond_sql = f"rsi14 < {rsi_thresh} AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * {bb_mult}"
@@ -173,7 +219,31 @@ print(f"候选: {len(picks_b1)} 只")
 for p in picks_b1:
     print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
 
-# === 策略3: BB0.99 ===
+# === 策略3: BB1.02 + KDJ Oversold ===
+print(f"\n=== BB1.02+KDJ（TOP500 7天）===")
+# KDJ过滤：在SQL里直接用 (kdj_k < 20 OR kdj_j < 0)
+cond_sql_kdj = f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * 1.02 AND (kdj_k < 20 OR kdj_j < 0)"
+top500_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:500]}
+placeholders = ','.join(f'"{s}"' for s in top500_syms)
+cond_sql_kdj += f" AND symbol IN ({placeholders})"
+
+candidates_kdj = db.execute(f"""
+    SELECT symbol, close, rsi14, boll_lower, kdj_k, kdj_j FROM kline_daily
+    WHERE trade_date='{latest}' AND {cond_sql_kdj}
+    ORDER BY rsi14 ASC
+""").fetchall()
+
+picks_kdj = []
+if market_ok_70:
+    for sym, close, rsi, bb, k, j in candidates_kdj:
+        picks_kdj.append((sym, close, rsi, bb, 0, fund.get(sym, 0)))
+picks_kdj.sort(key=lambda x: x[2])
+picks_kdj = picks_kdj[:20]
+print(f"候选: {len(picks_kdj)} 只")
+for p in picks_kdj:
+    print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
+
+# === 策略4: BB0.99 ===
 print(f"\n=== BB0.99 ===")
 picks_b099, _ = run_strategy("BB0.99", 20, 0.99, 70, False, 300, market_ok_70)
 print(f"候选: {len(picks_b099)} 只")
@@ -188,6 +258,7 @@ result_record = {
     "strategies": {
         "Fstop3_pt5_v10": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_v10]},
         "BB1.00": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b1]},
+        "BB1.02_KDJ": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_kdj]},
         "BB0.99": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b099]},
     },
     "market": {"weak_pct": round(weak_pct, 1), "market_ok_50": market_ok_50, "market_ok_70": market_ok_70}
@@ -242,7 +313,7 @@ def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False):
     ]
 
 elements = [
-    {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 三策略组合**"}},
+    {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 四策略组合**"}},
     {"tag": "hr"},
     {"tag": "div", "text": {"tag": "lark_md", "content": f"🟢 大盘弱市 {weak_pct:.1f}%（需50%:{'✅' if market_ok_50 else '❌'} | 需70%:{'✅' if market_ok_70 else '❌'}）"}},
     {"tag": "hr"},
@@ -252,7 +323,7 @@ elements = [
 elements += build_section(
     title="策略1️⃣ Fstop3_pt5（参考历史）",
     picks=picks_v10,
-    cond_md="回测参考：三阶段胜率 50.2%/61.4%/75.0% | 夏普 0.50/1.93/2.32",
+    cond_md="回测参考：三阶段胜率 58.6%/89.0%/68.4% | 夏普 2.92/2.32/3.90",
     note_md="建议：T+1开盘买 | 止损3%止盈5% | 持有个≤10天了结",
     show_vol=True,
 )
@@ -263,21 +334,29 @@ elements += build_section(
     cond_md="回测：三阶段胜率 57.7%/74.7%/69.2% | 夏普 1.43/3.76/3.26 | 测试52笔",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
 )
+# BB1.02+KDJ - framework eval metrics
+elements += build_section(
+    title="策略3️⃣ BB1.02+KDJ（⭐ 推荐）",
+    picks=picks_kdj,
+    cond_md="回测：三阶段胜率 56.9%/67.0%/63.6% | 夏普 1.33/2.76/2.59 | 测试187笔",
+    note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
+)
 # BB0.99 - framework eval metrics
 elements += build_section(
-    title="策略3️⃣ BB0.99",
+    title="策略4️⃣ BB0.99",
     picks=picks_b099,
     cond_md="回测：三阶段胜率 61.1%/81.4%/64.5% | 夏普 1.98/4.49/2.67 | 测试31笔",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
 )
 
-elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 三策略组合 | 不构成投资建议"}]})
+elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 四策略组合 | 不构成投资建议"}]})
 
 card = {"elements": elements}
 
 APP_ID = os.environ.get("APP_ID_BOT2", "cli_a938ffaf9738dbc6")
 APP_SECRET = os.environ.get("APP_SECRET_BOT2", "ulvmnUvH1VBlqgPq298isdQ1VFURenaR")
-OPEN_ID = os.environ.get("OPEN_ID_WIFE", "ou_8822a58f429ea317ab49166d79533b0f")
+OPEN_ID = os.environ.get("OPEN_ID_USER", "ou_8822a58f429ea317ab49166d79533b0f")  # 何强本人
+GROUP_ID = os.environ.get("GROUP_ID_HOME", "oc_7670b1e26e01cfdc95f70ec74734e6af")   # Home群
 
 r = requests.post('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
     json={'app_id': APP_ID, 'app_secret': APP_SECRET})
@@ -285,6 +364,7 @@ token = r.json().get('tenant_access_token')
 if not token:
     print("获取token失败"); db.close(); exit(1)
 
+# 私聊推送（默认）
 r2 = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
     params={'receive_id_type': 'open_id'},
     headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
@@ -295,9 +375,25 @@ r2 = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
     })
 resp = r2.json()
 if resp.get('code') == 0:
-    print(f"飞书推送成功")
+    print(f"飞书私聊推送成功")
 else:
-    print(f"飞书推送失败: {resp}")
+    print(f"飞书私聊推送失败: {resp}")
+
+# 群里推送（仅 --also-group 时）
+if args.also_group:
+    r3 = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
+        params={'receive_id_type': 'chat_id'},
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+        json={
+            'receive_id': GROUP_ID,
+            'msg_type': 'interactive',
+            'content': json.dumps(card)
+        })
+    resp3 = r3.json()
+    if resp3.get('code') == 0:
+        print(f"飞书群推送成功")
+    else:
+        print(f"飞书群推送失败: {resp3}")
 
 with open("/tmp/daily-pick-combined-card.json","w") as f:
     json.dump(card, f, ensure_ascii=False)
