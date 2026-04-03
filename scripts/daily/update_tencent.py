@@ -178,9 +178,12 @@ def save_kline(symbol, klines, table='kline_daily'):
         count = 0
         for k in klines:
             try:
-                c.execute(f'''INSERT OR REPLACE INTO {table}
+                c.execute(f'''INSERT INTO {table}
                     (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    open=excluded.open, close=excluded.close, high=excluded.high, low=excluded.low,
+                    volume=excluded.volume, amount=excluded.amount, chg=excluded.chg, chg_pct=excluded.chg_pct''',
                     (symbol, k['trade_date'], k['open'], k['close'], k['high'], k['low'],
                      k['volume'], k['amount'], k['chg'], k['chg_pct']))
                 count += 1
@@ -242,78 +245,27 @@ def sync_daily_kline():
 # ============================================================
 
 def sync_weekly_kline():
-    log("=== [腾讯] 同步周K线 ===")
-    # 检查表是否存在
-    conn = sqlite3.connect(DB_PATH)
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='kline_weekly'"
-    ).fetchall()]
-    conn.close()
-    if not tables:
-        log("  kline_weekly 表不存在，跳过")
-        return 0, 0
-
-    completed, failed = 0, 0
-    week_beg = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-
-    def process(sym):
-        nonlocal completed, failed
-        time.sleep(random.uniform(0.05, 0.15))
-        klines = fetch_tencent_kline(sym, 'week')
-        if klines:
-            save_kline(sym, klines, 'kline_weekly')
-            completed += 1
-        else:
-            failed += 1
-
-    global beg_date
-    orig_beg = beg_date
-    beg_date = week_beg
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(process, stock_list))
-    beg_date = orig_beg
-
-    log(f'  周K线完成: 成功 {completed}, 失败 {failed}')
-    return completed, failed
+    log("=== [计算] 从日K聚合生成周K线 ===")
+    weeks = 52 if args.full else 8
+    result = os.system(
+        f'python3 {os.path.dirname(os.path.abspath(__file__))}/calc_weekly_monthly.py --weekly-only --weeks {weeks}'
+    )
+    log(f"  周K线{'成功' if result == 0 else '失败'}")
+    return (0, 0) if result != 0 else (1, 0)
 
 
 # ============================================================
-# 3. 月K线更新（腾讯）
+# 3. 月K线更新（从日K聚合）
 # ============================================================
 
 def sync_monthly_kline():
-    log("=== [腾讯] 同步月K线 ===")
-    conn = sqlite3.connect(DB_PATH)
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='kline_monthly'"
-    ).fetchall()]
-    conn.close()
-    if not tables:
-        log("  kline_monthly 表不存在，跳过")
-        return 0, 0
-
-    completed, failed = 0, 0
-    month_beg = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
-
-    def process(sym):
-        nonlocal completed, failed
-        time.sleep(random.uniform(0.05, 0.15))
-        klines = fetch_tencent_kline(sym, 'month')
-        if klines:
-            save_kline(sym, klines, 'kline_monthly')
-            completed += 1
-        else:
-            failed += 1
-
-    global beg_date
-    orig_beg = beg_date
-    beg_date = month_beg
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(process, stock_list))
-    beg_date = orig_beg
-
-    log(f'  月K线完成: 成功 {completed}, 失败 {failed}')
-    return completed, failed
+    log("=== [计算] 从日K聚合生成月K线 ===")
+    months = 24 if args.full else 12
+    result = os.system(
+        f'python3 {os.path.dirname(os.path.abspath(__file__))}/calc_weekly_monthly.py --monthly-only --months {months}'
+    )
+    log(f"  月K线{'成功' if result == 0 else '失败'}")
+    return (0, 0) if result != 0 else (1, 0)
 
 
 # ============================================================
