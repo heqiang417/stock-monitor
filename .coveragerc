@@ -1,0 +1,19 @@
+[run]
+source = services, models, utils
+omit =
+    venv/*
+    tests/*
+    __pycache__/*
+
+[report]
+show_missing = true
+precision = 1
+fail_under = 40
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if __name__ == .__main__.:
+    raise NotImplementedError
+
+[html]
+directory = htmlcov

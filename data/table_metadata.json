@@ -1,0 +1,593 @@
+{
+  "kline_daily": {
+    "name": "日K线数据",
+    "desc": "个股每日行情与技术指标（729万条，核心数据表）",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "trade_date": "交易日期",
+      "open": "开盘价",
+      "close": "收盘价",
+      "high": "最高价",
+      "low": "最低价",
+      "volume": "成交量（手）",
+      "amount": "成交额（元）",
+      "chg": "涨跌额",
+      "chg_pct": "涨跌幅（%）",
+      "ma5": "5日均线",
+      "ma10": "10日均线",
+      "ma20": "20日均线",
+      "ma60": "60日均线",
+      "rsi14": "14日RSI指标",
+      "created_at": "创建时间",
+      "macd_dif": "MACD-DIF线",
+      "macd_dea": "MACD-DEA线",
+      "macd_hist": "MACD柱状图",
+      "boll_upper": "布林带上轨",
+      "boll_mid": "布林带中轨",
+      "boll_lower": "布林带下轨",
+      "kdj_k": "KDJ-K值",
+      "kdj_d": "KDJ-D值",
+      "kdj_j": "KDJ-J值",
+      "adx": "ADX趋势强度",
+      "plus_di": "+DI方向指标",
+      "minus_di": "-DI方向指标",
+      "atr": "平均真实波幅"
+    }
+  },
+  "kline_weekly": {
+    "name": "周K线数据",
+    "desc": "个股每周行情汇总",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "trade_week": "交易周",
+      "open": "周开盘价",
+      "close": "周收盘价",
+      "high": "周最高价",
+      "low": "周最低价",
+      "volume": "周成交量",
+      "amount": "周成交额",
+      "chg": "周涨跌额",
+      "chg_pct": "周涨跌幅（%）",
+      "created_at": "创建时间"
+    }
+  },
+  "kline_monthly": {
+    "name": "月K线数据",
+    "desc": "个股每月行情汇总",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "trade_month": "交易月",
+      "open": "月开盘价",
+      "close": "月收盘价",
+      "high": "月最高价",
+      "low": "月最低价",
+      "volume": "月成交量",
+      "amount": "月成交额",
+      "chg": "月涨跌额",
+      "chg_pct": "月涨跌幅（%）",
+      "created_at": "创建时间"
+    }
+  },
+  "kline_daily_index": {
+    "name": "指数日K线",
+    "desc": "大盘指数每日行情（上证、深证、创业板等）",
+    "columns": {
+      "symbol": "指数代码",
+      "trade_date": "交易日期",
+      "open": "开盘点位",
+      "high": "最高点位",
+      "low": "最低点位",
+      "close": "收盘点位",
+      "volume": "成交量",
+      "amount": "成交额",
+      "pct_change": "涨跌幅（%）",
+      "ma5": "5日均线",
+      "ma10": "10日均线",
+      "ma20": "20日均线",
+      "rsi14": "14日RSI"
+    }
+  },
+  "daily_valuation": {
+    "name": "每日估值",
+    "desc": "个股每日估值指标（PE/PB/PS）",
+    "columns": {
+      "symbol": "股票代码",
+      "trade_date": "交易日期",
+      "pe_ttm": "市盈率（TTM）",
+      "pb": "市净率",
+      "ps_ttm": "市销率（TTM）"
+    }
+  },
+  "financial_indicators": {
+    "name": "财务指标",
+    "desc": "个股季度/年度财务指标（EPS、ROE等）",
+    "columns": {
+      "symbol": "股票代码",
+      "report_date": "报告日期",
+      "eps": "每股收益",
+      "roe": "净资产收益率（%）",
+      "revenue_growth": "营收增长率（%）",
+      "profit_growth": "净利润增长率（%）",
+      "gross_margin": "毛利率（%）",
+      "net_margin": "净利率（%）",
+      "debt_ratio": "资产负债率（%）",
+      "current_ratio": "流动比率",
+      "total_assets": "总资产（元）"
+    }
+  },
+  "financial_daily": {
+    "name": "每日财务指标",
+    "desc": "将季度财务指标映射到每日（用于策略回测）",
+    "columns": {
+      "symbol": "股票代码",
+      "trade_date": "交易日期",
+      "eps": "每股收益",
+      "roe": "净资产收益率（%）",
+      "revenue_growth": "营收增长率（%）",
+      "profit_growth": "净利润增长率（%）",
+      "gross_margin": "毛利率（%）",
+      "net_margin": "净利率（%）",
+      "debt_ratio": "资产负债率（%）",
+      "current_ratio": "流动比率",
+      "total_assets": "总资产（元）"
+    }
+  },
+  "capital_flow": {
+    "name": "资金流向",
+    "desc": "个股每日主力/超大/大/中/小单资金流向",
+    "columns": {
+      "symbol": "股票代码",
+      "trade_date": "交易日期",
+      "main_net_inflow": "主力净流入（万元）",
+      "super_large_net_inflow": "超大单净流入",
+      "large_net_inflow": "大单净流入",
+      "medium_net_inflow": "中单净流入",
+      "small_net_inflow": "小单净流入",
+      "created_at": "创建时间",
+      "data_source": "数据来源"
+    }
+  },
+  "fund_flow": {
+    "name": "个股资金流",
+    "desc": "个股资金流向（含占比）",
+    "columns": {
+      "symbol": "股票代码",
+      "date": "日期",
+      "close": "收盘价",
+      "chg_pct": "涨跌幅（%）",
+      "main_net_inflow": "主力净流入",
+      "super_net_inflow": "超大单净流入",
+      "big_net_inflow": "大单净流入",
+      "mid_net_inflow": "中单净流入",
+      "small_net_inflow": "小单净流入",
+      "main_pct": "主力净占比（%）",
+      "super_pct": "超大单净占比",
+      "big_pct": "大单净占比",
+      "mid_pct": "中单净占比",
+      "small_pct": "小单净占比"
+    }
+  },
+  "stock_industry": {
+    "name": "股票行业",
+    "desc": "个股所属行业分类",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "industry": "行业名称",
+      "industry_code": "行业代码",
+      "updated_at": "更新时间"
+    }
+  },
+  "northbound_flow": {
+    "name": "北向资金",
+    "desc": "沪深港通北向资金每日净买入数据",
+    "columns": {
+      "id": "自增ID",
+      "date": "日期",
+      "type": "类型（沪股通/深股通）",
+      "direction": "方向",
+      "net_buy": "净买入（亿元）",
+      "net_flow": "净流入",
+      "up_count": "上涨家数",
+      "down_count": "下跌家数",
+      "index_chg": "指数涨跌幅"
+    }
+  },
+  "northbound_holdings": {
+    "name": "北向持仓",
+    "desc": "北向资金持有各股的股数和占比",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "trade_date": "交易日期",
+      "hold_shares": "持股数量（万股）",
+      "hold_pct": "持股占比（%）",
+      "created_at": "创建时间"
+    }
+  },
+  "margin_data": {
+    "name": "两融数据（沪）",
+    "desc": "上海证券交易所融资融券每日汇总",
+    "columns": {
+      "date": "日期",
+      "margin_balance": "融资余额（亿元）",
+      "margin_buy": "融资买入额",
+      "short_volume": "融券余量",
+      "short_amount": "融券余额",
+      "short_sell": "融券卖出量",
+      "total_balance": "两融余额合计"
+    }
+  },
+  "margin_szse": {
+    "name": "两融数据（深）",
+    "desc": "深圳证券交易所融资融券每日汇总",
+    "columns": {
+      "date": "日期",
+      "margin_buy": "融资买入额",
+      "margin_balance": "融资余额",
+      "short_sell": "融券卖出量",
+      "short_volume": "融券余量",
+      "short_balance": "融券余额",
+      "total_balance": "两融余额合计"
+    }
+  },
+  "stock_margin_detail": {
+    "name": "个股两融明细",
+    "desc": "每只股票每日的融资融券明细数据",
+    "columns": {
+      "trade_date": "交易日期",
+      "symbol": "股票代码",
+      "name": "股票名称",
+      "margin_balance": "融资余额",
+      "margin_buy": "融资买入额",
+      "margin_repay": "融资偿还额",
+      "short_volume": "融券余量",
+      "short_sell": "融券卖出量",
+      "short_repay": "融券偿还量"
+    }
+  },
+  "block_trades": {
+    "name": "大宗交易",
+    "desc": "每日大宗交易成交记录",
+    "columns": {
+      "id": "自增ID",
+      "trade_date": "交易日期",
+      "code": "股票代码",
+      "name": "股票名称",
+      "price": "成交价",
+      "volume": "成交量（万股）",
+      "amount": "成交额（万元）",
+      "buyer": "买方营业部",
+      "seller": "卖方营业部"
+    }
+  },
+  "lhb_detail": {
+    "name": "龙虎榜",
+    "desc": "每日龙虎榜异动个股明细",
+    "columns": {
+      "id": "自增ID",
+      "trade_date": "交易日期",
+      "code": "股票代码",
+      "name": "股票名称",
+      "reason": "上榜原因",
+      "buy_amount": "买入总额（万元）",
+      "sell_amount": "卖出总额",
+      "net_amount": "净买入额",
+      "turnover": "换手率（%）",
+      "mkt_cap": "流通市值",
+      "chg_after_1d": "上榜后1日涨跌幅",
+      "chg_after_5d": "上榜后5日涨跌幅",
+      "buy_seats": "买入席位",
+      "sell_seats": "卖出席位",
+      "data_source": "数据来源"
+    }
+  },
+  "limit_up_down": {
+    "name": "涨跌停数据",
+    "desc": "每日涨停/跌停个股详情",
+    "columns": {
+      "date": "日期",
+      "code": "股票代码",
+      "name": "股票名称",
+      "chg_pct": "涨跌幅（%）",
+      "close": "收盘价",
+      "amount": "成交额",
+      "mkt_cap": "流通市值",
+      "turnover": "换手率（%）",
+      "seal_amount": "封板资金",
+      "first_seal_time": "首次封板时间",
+      "last_seal_time": "最后封板时间",
+      "break_count": "开板次数",
+      "consecutive": "连板天数",
+      "industry": "所属行业",
+      "type": "类型（涨停/跌停）"
+    }
+  },
+  "institutional_data": {
+    "name": "机构调研",
+    "desc": "上市公司机构调研接待记录",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "name": "股票名称",
+      "latest_price": "最新价",
+      "change_pct": "涨跌幅",
+      "institution_count": "参与机构数",
+      "reception_method": "接待方式",
+      "reception_personnel": "接待人员",
+      "reception_location": "接待地点",
+      "reception_date": "接待日期",
+      "announcement_date": "公告日期",
+      "created_at": "创建时间"
+    }
+  },
+  "shareholder_data": {
+    "name": "股东数据",
+    "desc": "上市公司股东户数及持股数据",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "report_date": "报告日期",
+      "total_shareholders": "股东总户数",
+      "change_pct": "户数变化率（%）",
+      "avg_holdings": "户均持股",
+      "top10_pct": "前十大股东持股比例（%）",
+      "created_at": "创建时间",
+      "shareholder_count": "股东人数",
+      "avg_market_value": "户均持股市值",
+      "total_market_value": "总市值",
+      "total_shares": "总股本",
+      "change_count": "变动户数",
+      "price_change_pct": "期间涨跌幅",
+      "share_change": "股本变动",
+      "share_change_reason": "变动原因",
+      "announcement_date": "公告日期",
+      "name": "股票名称"
+    }
+  },
+  "shareholder_change": {
+    "name": "股东增减持",
+    "desc": "大股东/高管增减持记录",
+    "columns": {
+      "code": "股票代码",
+      "name": "股票名称",
+      "change_date": "变动日期",
+      "shareholder_name": "股东名称",
+      "change_amount": "变动数量（万股）",
+      "change_price": "变动价格",
+      "remaining_shares": "变动后持股",
+      "change_period": "变动期间",
+      "change_method": "变动方式"
+    }
+  },
+  "share_lock": {
+    "name": "限售股解禁",
+    "desc": "限售股解禁计划及影响分析",
+    "columns": {
+      "id": "自增ID",
+      "stock_code": "股票代码",
+      "stock_name": "股票名称",
+      "unlock_date": "解禁日期",
+      "share_type": "股份类型",
+      "unlock_shares": "解禁数量（万股）",
+      "actual_unlock_shares": "实际解禁数",
+      "actual_unlock_value": "实际解禁市值",
+      "ratio": "解禁比例（%）",
+      "prev_close": "解禁前收盘价",
+      "prev20d_chg": "解禁前20日涨跌幅",
+      "post20d_chg": "解禁后20日涨跌幅"
+    }
+  },
+  "share_unlock": {
+    "name": "解禁数据",
+    "desc": "限售股解禁数据（另一数据源）",
+    "columns": {
+      "date": "解禁日期",
+      "code": "股票代码",
+      "name": "股票名称",
+      "unlock_amount": "解禁数量",
+      "unlock_ratio": "解禁比例（%）",
+      "price": "当前价格",
+      "actual_unlock_amount": "实际解禁数量",
+      "actual_unlock_market_value": "实际解禁市值",
+      "pre_20d_change": "解禁前20日涨跌幅",
+      "post_20d_change": "解禁后20日涨跌幅"
+    }
+  },
+  "dividends": {
+    "name": "分红配送",
+    "desc": "上市公司分红送股方案",
+    "columns": {
+      "id": "自增ID",
+      "stock_code": "股票代码",
+      "stock_name": "股票名称",
+      "announce_date": "公告日期",
+      "div_type": "分红类型",
+      "bonus_ratio": "送股比例",
+      "transfer_ratio": "转增比例",
+      "cash_div": "每股派息（元）",
+      "record_date": "股权登记日",
+      "ex_div_date": "除权除息日",
+      "pay_date": "派息日",
+      "shares_arrive_date": "送股到账日",
+      "div_desc": "分红方案描述",
+      "report_period": "报告期"
+    }
+  },
+  "earnings_forecast": {
+    "name": "业绩预告",
+    "desc": "上市公司业绩预告（预增/预减/扭亏等）",
+    "columns": {
+      "code": "股票代码",
+      "name": "股票名称",
+      "report_date": "报告期",
+      "forecast_type": "预告类型",
+      "forecast_content": "预告内容",
+      "profit_min": "净利润下限（万元）",
+      "profit_max": "净利润上限",
+      "forecast_change_min": "变动幅度下限（%）",
+      "forecast_change_max": "变动幅度上限（%）",
+      "reason": "变动原因",
+      "prev_year_value": "上年同期值",
+      "announce_date": "公告日期"
+    }
+  },
+  "stock_repurchase": {
+    "name": "股票回购",
+    "desc": "上市公司股票回购计划及执行情况",
+    "columns": {
+      "code": "股票代码",
+      "name": "股票名称",
+      "announce_date": "公告日期",
+      "repurchase_amount": "回购金额（万元）",
+      "repurchase_price_high": "回购价格上限",
+      "repurchase_price_low": "回购价格下限",
+      "repurchase_ratio": "回购比例（%）",
+      "status": "回购状态",
+      "latest_price": "最新价格",
+      "planned_amount_min": "计划回购下限",
+      "planned_amount_max": "计划回购上限",
+      "actual_amount": "实际回购金额",
+      "actual_price_low": "实际回购价格下限",
+      "actual_price_high": "实际回购价格上限"
+    }
+  },
+  "chip_distribution": {
+    "name": "筹码分布",
+    "desc": "个股筹码分布及成本分析",
+    "columns": {
+      "symbol": "股票代码",
+      "trade_date": "交易日期",
+      "chip_data": "筹码分布数据（JSON）",
+      "avg_cost": "平均成本",
+      "profit_ratio": "获利比例（%）",
+      "concentration_90": "90%筹码集中度",
+      "concentration_70": "70%筹码集中度"
+    }
+  },
+  "option_data": {
+    "name": "期权数据",
+    "desc": "上证50ETF期权数据",
+    "columns": {
+      "date": "日期",
+      "code": "期权代码",
+      "name": "期权名称",
+      "close": "收盘价",
+      "volume": "成交量",
+      "amount": "成交额",
+      "oi": "持仓量",
+      "pcr": "认沽/认购比"
+    }
+  },
+  "market_review": {
+    "name": "市场复盘",
+    "desc": "每日市场综合复盘数据",
+    "columns": {
+      "trade_date": "交易日期",
+      "index_data": "指数数据（JSON）",
+      "up_count": "上涨家数",
+      "down_count": "下跌家数",
+      "flat_count": "平盘家数",
+      "limit_up": "涨停家数",
+      "limit_down": "跌停家数",
+      "top_sectors": "涨幅前5行业",
+      "bottom_sectors": "跌幅前5行业"
+    }
+  },
+  "news_daily": {
+    "name": "每日新闻",
+    "desc": "个股相关财经新闻",
+    "columns": {
+      "id": "自增ID",
+      "symbol": "股票代码",
+      "title": "新闻标题",
+      "url": "新闻链接",
+      "snippet": "新闻摘要",
+      "publish_date": "发布日期",
+      "source": "新闻来源",
+      "created_at": "创建时间"
+    }
+  },
+  "alert_history": {
+    "name": "告警历史",
+    "desc": "策略触发告警记录",
+    "columns": {
+      "id": "自增ID",
+      "timestamp": "触发时间戳",
+      "stock": "股票代码",
+      "price": "触发价格",
+      "chg_pct": "涨跌幅",
+      "strategy_id": "策略ID",
+      "strategy_name": "策略名称",
+      "trigger_condition": "触发条件",
+      "message": "告警消息",
+      "level": "告警级别",
+      "feishu_sent": "飞书已发送",
+      "is_read": "已读",
+      "created_at": "创建时间"
+    }
+  },
+  "alerts": {
+    "name": "告警配置",
+    "desc": "当前活跃的告警规则",
+    "columns": {
+      "id": "自增ID",
+      "timestamp": "创建时间戳",
+      "strategy_id": "策略ID",
+      "message": "告警消息",
+      "level": "告警级别",
+      "created_at": "创建时间",
+      "stock": "股票代码",
+      "trigger_condition": "触发条件",
+      "price": "价格",
+      "is_read": "已读"
+    }
+  },
+  "strategies": {
+    "name": "交易策略",
+    "desc": "已配置的选股/交易策略",
+    "columns": {
+      "id": "策略ID",
+      "name": "策略名称",
+      "enabled": "是否启用",
+      "logic": "策略逻辑",
+      "conditions": "触发条件（JSON）",
+      "actions": "执行动作（JSON）",
+      "last_triggered": "最后触发时间",
+      "trigger_count": "触发次数"
+    }
+  },
+  "watchlist": {
+    "name": "关注列表",
+    "desc": "正在监控的股票列表",
+    "columns": {
+      "symbol": "股票代码",
+      "name": "股票名称",
+      "added_at": "添加时间"
+    }
+  },
+  "stock_history": {
+    "name": "实时行情",
+    "desc": "股票实时行情快照（WebSocket推送）",
+    "columns": {
+      "id": "自增ID",
+      "timestamp": "时间戳",
+      "price": "最新价",
+      "open": "开盘价",
+      "high": "最高价",
+      "low": "最低价",
+      "volume": "成交量",
+      "amount": "成交额",
+      "chg": "涨跌额",
+      "chg_pct": "涨跌幅（%）",
+      "bid1_price": "买一价",
+      "bid1_vol": "买一量",
+      "ask1_price": "卖一价",
+      "ask1_vol": "卖一量",
+      "created_at": "创建时间"
+    }
+  }
+}

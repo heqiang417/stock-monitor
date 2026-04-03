@@ -1,0 +1,7 @@
+{
+  "_comment": "Feishu credentials should be set via environment variables FEISHU_APP_ID and FEISHU_APP_SECRET",
+  "app_id": "",
+  "app_secret": "",
+  "receive_id": "ou_8822a58f429ea317ab49166d79533b0f",
+  "updated_at": "2026-03-17T17:00:00"
+}

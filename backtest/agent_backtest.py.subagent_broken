@@ -1,0 +1,919 @@
+#!/usr/bin/env python3
+"""
+Agent Backtest Loop - ReAct 架构（兼容不支持 tool_use 的模型）
+=============================================================
+核心：while True 循环 + 文本解析工具调用 + TodoWrite 任务规划
+
+架构（Layer 1-3）：
+- Layer 1: Agent Loop（累积 messages，模型输出 stop 则退出）
+- Layer 2: 工具层（dispatch map，加工具不改循环）
+- Layer 3: TodoWrite（同一时刻只能一个 in_progress，nag reminder 追责）
+
+用法：
+  python backtest/agent_backtest.py --rounds 20
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+# ===================== 配置 =====================
+DB_PATH = os.getenv("STOCK_DB", "/home/heqiang/stock_data_ro.db")
+
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1"
+
+MODEL = "MiniMax-M2.7"
+MAX_TOKENS = 2048
+
+TOP_N = 200
+TARGET_WIN_RATE = 55.0
+
+PHASES = {
+    "train": ("2021-01-01", "2024-06-30"),
+    "val":   ("2024-07-01", "2025-07-01"),
+    "test":  ("2025-07-02", "2026-03-24"),
+}
+
+# ===================== 信号定义 =====================
+SIGNALS = {
+    # ===== 已有（保留）=====
+    "rsi": {"desc": "RSI超卖", "params": ["rsi_period", "rsi_thresh"]},
+    "bb_break": {"desc": "布林下轨突破", "params": ["bb_std", "hold_days"]},
+    "macd_goldCross": {"desc": "MACD金叉", "params": ["hold_days"]},
+    "ma_cross": {"desc": "MA金叉(MA5上穿MA10)", "params": ["ma_short", "ma_long", "hold_days"]},
+    "bollinger_bounce": {"desc": "布林下轨反弹", "params": ["hold_days"]},
+    "volume_breakout": {"desc": "放量突破", "params": ["vol_mult", "hold_days"]},
+    # ===== 新增信号 ======
+    # KDJ 系列
+    "kdj_goldCross": {"desc": "KDJ金叉(K线上穿D线)", "params": ["hold_days"]},
+    "kdj_oversold": {"desc": "KDJ超卖(J<20)", "params": ["kdj_thresh", "hold_days"]},
+    # CCI
+    "cci_oversold": {"desc": "CCI超卖(<-100)", "params": ["cci_thresh", "hold_days"]},
+    # WR威廉指标
+    "wr_oversold": {"desc": "威廉指标超卖(WR>80)", "params": ["wr_thresh", "hold_days"]},
+    # BIAS乖离率
+    "bias_oversold": {"desc": "BIAS超卖(偏离均线过远)", "params": ["bias_period", "bias_thresh", "hold_days"]},
+    "bias_rebound": {"desc": "BIAS反弹(从极低值回升)", "params": ["bias_period", "bias_thresh", "hold_days"]},
+    # PSY心理线
+    "psy_oversold": {"desc": "PSY超卖(<25)", "params": ["psy_period", "psy_thresh", "hold_days"]},
+    # VR容量比率
+    "vr_oversold": {"desc": "VR超卖(<70)", "params": ["vr_period", "vr_thresh", "hold_days"]},
+    # DMA差分移动平均
+    "dma_goldCross": {"desc": "DMA金叉", "params": ["dma_period", "hold_days"]},
+    # EXPMA指数平滑
+    "expma_goldCross": {"desc": "EXPMA金叉", "params": ["expma_period", "hold_days"]},
+    # TEMA三重指数平滑
+    "tema_goldCross": {"desc": "TEMA金叉", "params": ["tema_period", "hold_days"]},
+    # MACD信号增强
+    "macd_hist_turn": {"desc": "MACD柱状图由负转正", "params": ["hold_days"]},
+    "macd_divergence": {"desc": "MACD底背离(价格新低但DIF未新低)", "params": ["hold_days"]},
+    # 换手率
+    "turnover_spike": {"desc": "换手率突增", "params": ["turnover_mult", "hold_days"]},
+    # 成交量综合
+    "volume_shrink": {"desc": "地量(缩量到极致后反弹)", "params": ["shrink_ratio", "hold_days"]},
+    "volume_mean_reversion": {"desc": "均量线回归(量先跌后涨)", "params": ["vol_period", "hold_days"]},
+    # 多周期共振
+    "rsi_ma_combo": {"desc": "RSI超卖+MA多头共振", "params": ["rsi_thresh", "hold_days"]},
+    "kdj_macd_combo": {"desc": "KDJ金叉+MACD金叉共振", "params": ["hold_days"]},
+    # 趋势确认
+    "adx_plusDI": {"desc": "ADX>20且+DI>-DI趋势确认", "params": ["adx_thresh", "hold_days"]},
+    # 支撑压力
+    "price_support": {"desc": "价格触及N日最低价支撑", "params": ["n_days", "hold_days"]},
+    "price_resistance": {"desc": "价格触及N日最高价压力", "params": ["n_days", "hold_days"]},
+}
+
+
+# ===================== 数据库 =====================
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute("PRAGMA cache_size=-65536")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+# ===================== 工具层（Layer 2）=====================
+
+def scan_market(phase: str = "train", limit: int = TOP_N) -> dict:
+    """扫描市场候选股票"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        start, end = PHASES.get(phase, PHASES["train"])
+        rows = cursor.execute("""
+            SELECT symbol, COUNT(*) as days, SUM(volume) as total_vol,
+                   AVG(rsi14) as avg_rsi, MAX(rsi14) as max_rsi, MIN(rsi14) as min_rsi
+            FROM kline_daily
+            WHERE trade_date BETWEEN ? AND ?
+              AND volume > 0 AND rsi14 IS NOT NULL
+            GROUP BY symbol
+            HAVING days > 100
+            ORDER BY total_vol DESC
+            LIMIT ?
+        """, (start, end, limit)).fetchall()
+
+        stocks = [{
+            "symbol": r[0], "days": r[1],
+            "total_vol": round(r[2], 2) if r[2] else 0,
+            "avg_rsi": round(r[3], 1) if r[3] else 50,
+            "max_rsi": round(r[4], 1) if r[4] else 50,
+            "min_rsi": round(r[5], 1) if r[5] else 50,
+        } for r in rows]
+        return {"ok": True, "phase": phase, "count": len(stocks), "candidates": stocks}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        if conn:
+            conn.close()
+
+
+def _compute_adx(highs, lows, closes, period: int = 14) -> tuple:
+    """计算 ADX/+DI/-DI，返回 (adx, plus_di, minus_di) 列表，与输入等长（前 period 个为 None）"""
+    n = len(highs)
+    if n < period + 1:
+        return [None] * n, [None] * n, [None] * n
+
+    tr_list = [None] * period
+    plus_dm = [None] * period
+    minus_dm = [None] * period
+
+    for i in range(1, period + 1):
+        hl = highs[i] - lows[i]
+        hc = abs(highs[i] - closes[i - 1])
+        lc = abs(lows[i] - closes[i - 1])
+        tr_list[i - 1] = max(hl, hc, lc)
+        high_diff = highs[i] - highs[i - 1]
+        low_diff = lows[i - 1] - lows[i]
+        plus_dm[i - 1] = high_diff if high_diff > low_diff and high_diff > 0 else 0
+        minus_dm[i - 1] = low_diff if low_diff > high_diff and low_diff > 0 else 0
+
+    # 初始 ATR/DI
+    atr = sum(tr_list) / period
+    plus_di_sum = sum(plus_dm)
+    minus_di_sum = sum(minus_dm)
+
+    adx_list = [None] * (period * 2)
+    plus_di_list = [None] * (period * 2)
+    minus_di_list = [None] * (period * 2)
+
+    for i in range(period, n):
+        idx = i - period
+        hl = highs[i] - lows[i]
+        hc = abs(highs[i] - closes[i - 1])
+        lc = abs(lows[i] - closes[i - 1])
+        tr = max(hl, hc, lc)
+        pdm = max(highs[i] - highs[i - 1], 0) if (highs[i] - highs[i - 1]) > (lows[i - 1] - lows[i]) else 0
+        mdm = max(lows[i - 1] - lows[i], 0) if (lows[i - 1] - lows[i]) > (highs[i] - highs[i - 1]) else 0
+
+        atr = (atr * (period - 1) + tr) / period
+        plus_di_sum = (plus_di_sum * (period - 1) + pdm) / period
+        minus_di_sum = (minus_di_sum * (period - 1) + mdm) / period
+
+        plus_di = (plus_di_sum / atr * 100) if atr != 0 else 0
+        minus_di = (minus_di_sum / atr * 100) if atr != 0 else 0
+        dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100 if (plus_di + minus_di) != 0 else 0
+
+        # 平滑 ADX
+        if i == period * 2 - 1:
+            adx_val = sum(adx_list[i - period + 1:i]) / period if i > period else dx
+            adx_list[i] = adx_val
+        elif i > period * 2 - 1:
+            adx_val = (adx_list[i - 1] * (period - 1) + dx) / period
+            adx_list[i] = adx_val
+        else:
+            adx_list[i] = None
+
+        plus_di_list[i] = plus_di
+        minus_di_list[i] = minus_di
+
+    return adx_list, plus_di_list, minus_di_list
+
+
+def backtest_signal(symbol: str, signal_type: str, params: dict,
+                    phase: str = "train") -> dict:
+    """对单只股票回测"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        start, end = PHASES.get(phase, PHASES["train"])
+        rows = cursor.execute(f"""
+            SELECT trade_date, open, high, low, close, volume,
+                   rsi14, ma5, ma10, ma20,
+                   macd_dif, macd_dea, macd_hist,
+                   boll_lower, boll_upper, boll_mid,
+                   kdj_k, kdj_d, kdj_j,
+                   cci_14, wr_14,
+                   bias_6, bias_12, bias_26,
+                   psy_12, psy_24,
+                   vr, ar, brar,
+                   dma_dif, dma_ma10,
+                   expma1, expma2,
+                   tema_12, tema_26,
+                   turnover_rate
+            FROM kline_daily
+            WHERE symbol = ? AND trade_date BETWEEN ? AND ?
+            ORDER BY trade_date ASC
+        """, (symbol, start, end)).fetchall()
+
+        if len(rows) < 30:
+            return {"ok": False, "error": f"数据不足: {len(rows)}条"}
+
+        # 字段索引映射
+        # 0:trade_date 1:open 2:high 3:low 4:close 5:volume
+        # 6:rsi14 7:ma5 8:ma10 9:ma20
+        # 10:macd_dif 11:macd_dea 12:macd_hist
+        # 13:boll_lower 14:boll_upper 15:boll_mid
+        # 16:kdj_k 17:kdj_d 18:kdj_j
+        # 19:cci_14 20:wr_14
+        # 21:bias_6 22:bias_12 23:bias_26
+        # 24:psy_12 25:psy_24
+        # 26:vr 27:ar 28:brar
+        # 29:dma_dif 30:dma_ma10
+        # 31:expma1 32:expma2
+        # 33:tema_12 34:tema_26
+        # 35:turnover_rate
+
+        dates    = [r[0]  for r in rows]
+        opens    = [r[1]  for r in rows]
+        highs    = [r[2]  for r in rows]
+        lows     = [r[3]  for r in rows]
+        closes   = [r[4]  for r in rows]
+        volumes  = [r[5]  for r in rows]
+        rsi14_l  = [r[6]  for r in rows]
+        ma5_l    = [r[7]  for r in rows]
+        ma10_l   = [r[8]  for r in rows]
+        ma20_l   = [r[9]  for r in rows]
+        macd_dif = [r[10] for r in rows]
+        macd_dea = [r[11] for r in rows]
+        macd_hst = [r[12] for r in rows]
+        boll_low = [r[13] for r in rows]
+        boll_up  = [r[14] for r in rows]
+        boll_mid = [r[15] for r in rows]
+        kdj_k    = [r[16] for r in rows]
+        kdj_d    = [r[17] for r in rows]
+        kdj_j    = [r[18] for r in rows]
+        cci_14   = [r[19] for r in rows]
+        wr_14    = [r[20] for r in rows]
+        bias_6   = [r[21] for r in rows]
+        bias_12  = [r[22] for r in rows]
+        bias_26  = [r[23] for r in rows]
+        psy_12   = [r[24] for r in rows]
+        psy_24   = [r[25] for r in rows]
+        vr       = [r[26] for r in rows]
+        ar       = [r[27] for r in rows]
+        brar     = [r[28] for r in rows]
+        dma_dif  = [r[29] for r in rows]
+        dma_ma10 = [r[30] for r in rows]
+        expma1   = [r[31] for r in rows]
+        expma2   = [r[32] for r in rows]
+        tema_12  = [r[33] for r in rows]
+        tema_26  = [r[34] for r in rows]
+        turnover = [r[35] for r in rows]
+
+        # 预计算 ADX（用于 adx_plusDI）
+        adx_list, plus_di_list, minus_di_list = _compute_adx(highs, lows, closes)
+
+        hold_days = params.get("hold_days", 7)
+        signal_count = win_count = 0
+        total_return = 0.0
+        trades = []
+
+        i = 0
+        while i < len(rows) - hold_days:
+            trigger = False
+
+            # ==================== 已有信号 ====================
+            if signal_type == "rsi":
+                thresh = params.get("rsi_thresh", 20)
+                if rsi14_l[i] is not None and rsi14_l[i] <= thresh:
+                    trigger = True
+
+            elif signal_type == "bb_break":
+                thresh = params.get("bb_thresh", 1.0)
+                if boll_low[i] is not None and closes[i] <= boll_low[i] * thresh:
+                    trigger = True
+
+            elif signal_type == "macd_goldCross":
+                if macd_dif[i] is not None and macd_dea[i] is not None:
+                    if i > 0 and macd_dif[i] > macd_dea[i] and macd_dif[i-1] <= macd_dea[i-1]:
+                        trigger = True
+
+            elif signal_type == "ma_cross":
+                ma_short_key = params.get("ma_short", "ma5")
+                ma_long_key = params.get("ma_long", "ma10")
+                ma_short = {"ma5": ma5_l, "ma10": ma10_l, "ma20": ma20_l}.get(ma_short_key)
+                ma_long = {"ma5": ma5_l, "ma10": ma10_l, "ma20": ma20_l}.get(ma_long_key)
+                if ma_short and ma_long:
+                    if ma_short[i] is not None and ma_long[i] is not None:
+                        if i > 0 and ma_short[i] > ma_long[i] and ma_short[i-1] <= ma_long[i-1]:
+                            trigger = True
+
+            elif signal_type == "bollinger_bounce":
+                if boll_low[i] is not None and closes[i] <= boll_low[i]:
+                    trigger = True
+
+            elif signal_type == "volume_breakout":
+                vol_thresh = params.get("vol_mult", 1.5)
+                avg_v = sum(volumes[max(0, i-20):i]) / min(20, i+1) if i > 0 else volumes[0]
+                if volumes[i] > avg_v * vol_thresh:
+                    trigger = True
+
+            # ==================== KDJ 系列 ====================
+            elif signal_type == "kdj_goldCross":
+                if kdj_k[i] is not None and kdj_d[i] is not None:
+                    if i > 0 and kdj_k[i] > kdj_d[i] and kdj_k[i-1] <= kdj_d[i-1]:
+                        trigger = True
+
+            elif signal_type == "kdj_oversold":
+                thresh = params.get("kdj_thresh", 20)
+                if kdj_j[i] is not None and kdj_j[i] < thresh:
+                    trigger = True
+
+            # ==================== CCI ====================
+            elif signal_type == "cci_oversold":
+                thresh = params.get("cci_thresh", -100)
+                if cci_14[i] is not None and cci_14[i] < thresh:
+                    trigger = True
+
+            # ==================== WR 威廉指标 ====================
+            elif signal_type == "wr_oversold":
+                thresh = params.get("wr_thresh", 80)
+                if wr_14[i] is not None and wr_14[i] > thresh:
+                    trigger = True
+
+            # ==================== BIAS 乖离率 ====================
+            elif signal_type == "bias_oversold":
+                period = params.get("bias_period", 12)
+                thresh = params.get("bias_thresh", -5)
+                bias = {"6": bias_6, "12": bias_12, "26": bias_26}.get(str(period))
+                if bias and bias[i] is not None and bias[i] < thresh:
+                    trigger = True
+
+            elif signal_type == "bias_rebound":
+                period = params.get("bias_period", 12)
+                thresh = params.get("bias_thresh", -8)
+                bias = {"6": bias_6, "12": bias_12, "26": bias_26}.get(str(period))
+                if bias and bias[i] is not None and bias[i] < thresh:
+                    # 今日BIAS在阈值以下，且昨日BIAS更低（反弹迹象）
+                    if i > 0 and bias[i-1] is not None and bias[i-1] < bias[i]:
+                        trigger = True
+
+            # ==================== PSY 心理线 ====================
+            elif signal_type == "psy_oversold":
+                period = params.get("psy_period", 12)
+                thresh = params.get("psy_thresh", 25)
+                psy = {"12": psy_12, "24": psy_24}.get(str(period))
+                if psy and psy[i] is not None and psy[i] < thresh:
+                    trigger = True
+
+            # ==================== VR 容量比率 ====================
+            elif signal_type == "vr_oversold":
+                thresh = params.get("vr_thresh", 70)
+                if vr[i] is not None and vr[i] < thresh:
+                    trigger = True
+
+            # ==================== DMA 差分移动平均 ====================
+            elif signal_type == "dma_goldCross":
+                if dma_dif[i] is not None and dma_ma10[i] is not None:
+                    if i > 0 and dma_dif[i] > dma_ma10[i] and dma_dif[i-1] <= dma_ma10[i-1]:
+                        trigger = True
+
+            # ==================== EXPMA 指数平滑 ====================
+            elif signal_type == "expma_goldCross":
+                if expma1[i] is not None and expma2[i] is not None:
+                    if i > 0 and expma1[i] > expma2[i] and expma1[i-1] <= expma2[i-1]:
+                        trigger = True
+
+            # ==================== TEMA 三重指数平滑 ====================
+            elif signal_type == "tema_goldCross":
+                if tema_12[i] is not None and tema_26[i] is not None:
+                    if i > 0 and tema_12[i] > tema_26[i] and tema_12[i-1] <= tema_26[i-1]:
+                        trigger = True
+
+            # ==================== MACD 信号增强 ====================
+            elif signal_type == "macd_hist_turn":
+                # MACD柱状图由负转正
+                if macd_hst[i] is not None and macd_hst[i] > 0:
+                    if i > 0 and macd_hst[i-1] is not None and macd_hst[i-1] <= 0:
+                        trigger = True
+
+            elif signal_type == "macd_divergence":
+                # 底背离：价格新低但DIF未新低
+                if i >= 20:
+                    price_low_window = min(closes[max(0, i-20):i+1])
+                    dif_low_window = min(macd_dif[max(0, i-20):i+1])
+                    if closes[i] == price_low_window and macd_dif[i] > dif_low_window:
+                        trigger = True
+
+            # ==================== 换手率 ====================
+            elif signal_type == "turnover_spike":
+                mult = params.get("turnover_mult", 2.0)
+                avg_to = sum(turnover[max(0, i-20):i]) / min(20, i+1) if i > 0 else (turnover[0] or 0)
+                if turnover[i] is not None and avg_to > 0 and turnover[i] > avg_to * mult:
+                    trigger = True
+
+            # ==================== 成交量综合 ====================
+            elif signal_type == "volume_shrink":
+                shrink_ratio = params.get("shrink_ratio", 0.3)
+                avg_v = sum(volumes[max(0, i-20):i]) / min(20, i+1) if i > 0 else volumes[0]
+                if volumes[i] < avg_v * shrink_ratio and volumes[i] < volumes[max(0, i-1)]:
+                    trigger = True
+
+            elif signal_type == "volume_mean_reversion":
+                vol_period = params.get("vol_period", 5)
+                if i >= vol_period:
+                    recent_avg = sum(volumes[i-vol_period+1:i+1]) / vol_period
+                    past_avg = sum(volumes[max(0, i-vol_period*2):i-vol_period+1]) / min(vol_period, i-vol_period+1)
+                    # 前期缩量（低于过去均量），今日放量（高于近期均量）
+                    if past_avg > 0 and volumes[i] > recent_avg and past_avg < recent_avg * 0.8:
+                        trigger = True
+
+            # ==================== 多周期共振 ====================
+            elif signal_type == "rsi_ma_combo":
+                rsi_thresh = params.get("rsi_thresh", 30)
+                # RSI超卖 + MA多头排列（ma5>ma10>ma20）
+                rsi_ok = rsi14_l[i] is not None and rsi14_l[i] <= rsi_thresh
+                ma_ok = (ma5_l[i] is not None and ma10_l[i] is not None and ma20_l[i] is not None and
+                         ma5_l[i] > ma10_l[i] > ma20_l[i])
+                if rsi_ok and ma_ok:
+                    trigger = True
+
+            elif signal_type == "kdj_macd_combo":
+                # KDJ金叉 + MACD金叉共振
+                kdj_cross = (i > 0 and kdj_k[i] is not None and kdj_d[i] is not None and
+                             kdj_k[i] > kdj_d[i] and kdj_k[i-1] <= kdj_d[i-1])
+                macd_cross = (i > 0 and macd_dif[i] is not None and macd_dea[i] is not None and
+                               macd_dif[i] > macd_dea[i] and macd_dif[i-1] <= macd_dea[i-1])
+                if kdj_cross and macd_cross:
+                    trigger = True
+
+            # ==================== 趋势确认 ====================
+            elif signal_type == "adx_plusDI":
+                thresh = params.get("adx_thresh", 20)
+                adx_val = adx_list[i]
+                pd_val = plus_di_list[i]
+                md_val = minus_di_list[i]
+                if adx_val is not None and pd_val is not None and md_val is not None:
+                    if adx_val > thresh and pd_val > md_val:
+                        trigger = True
+
+            # ==================== 支撑压力 ====================
+            elif signal_type == "price_support":
+                n_days = params.get("n_days", 20)
+                if i >= n_days:
+                    window_low = min(lows[i-n_days:i])
+                    if closes[i] <= window_low * 1.01:  # 触及N日最低价附近
+                        trigger = True
+
+            elif signal_type == "price_resistance":
+                n_days = params.get("n_days", 20)
+                if i >= n_days:
+                    window_high = max(highs[i-n_days:i])
+                    if closes[i] >= window_high * 0.99:  # 触及N日最高价附近
+                        trigger = True
+
+            if trigger:
+                signal_count += 1
+                ep = rows[i + 1][1] if i + 1 < len(rows) else rows[i][1]
+                ed = dates[i + 1]    if i + 1 < len(rows) else dates[i]
+                xi = min(i + hold_days, len(rows) - 1)
+                xp = rows[xi][4]
+                ret = (xp - ep) / ep * 100
+                total_return += ret
+                if ret > 0:
+                    win_count += 1
+                trades.append({
+                    "symbol": symbol, "entry_date": ed, "entry_price": round(ep, 2),
+                    "exit_date": dates[xi], "exit_price": round(xp, 2),
+                    "return_pct": round(ret, 2), "signal": signal_type,
+                })
+                i += hold_days
+            else:
+                i += 1
+
+        if signal_count == 0:
+            return {"ok": False, "error": "无信号"}
+
+        return {
+            "ok": True, "symbol": symbol, "signal_type": signal_type,
+            "params": params, "phase": phase,
+            "signal_count": signal_count, "win_count": win_count,
+            "win_rate": round(win_count / signal_count * 100, 1),
+            "avg_return": round(total_return / signal_count, 2),
+            "total_return": round(total_return, 2),
+            "trades": trades[:5],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        if conn:
+            conn.close()
+
+
+def evaluate_result(result: dict) -> dict:
+    """评估是否达标"""
+    if not result.get("ok"):
+        return {"ok": False, "qualified": False, "reason": result.get("error", "回测失败")}
+    wr = result.get("win_rate", 0)
+    ar = result.get("avg_return", 0)
+    sc = result.get("signal_count", 0)
+    if sc < 5:
+        return {"ok": True, "qualified": False, "reason": f"信号太少({sc}笔)", "win_rate": wr, "avg_return": ar}
+    if wr < TARGET_WIN_RATE:
+        return {"ok": True, "qualified": False, "reason": f"胜率{wr}%<{TARGET_WIN_RATE}%", "win_rate": wr, "avg_return": ar}
+    if ar < 0:
+        return {"ok": True, "qualified": False, "reason": f"均益{ar}%<0", "win_rate": wr, "avg_return": ar}
+    return {"ok": True, "qualified": True, "win_rate": wr, "avg_return": ar, "signal_count": sc,
+            "reason": f"✅ 达标: 胜率{wr}%, 均益{ar}%, {sc}笔"}
+
+
+def push_candidate(candidate: dict) -> dict:
+    """推送达标策略"""
+    f = Path(__file__).parent.parent / "data" / "results" / "agent_candidates.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "a") as fp:
+        fp.write(json.dumps({**candidate, "found_at": datetime.now().isoformat()}, ensure_ascii=False) + "\n")
+    return {"ok": True, "count": sum(1 for _ in open(f))}
+
+
+# ===================== 工具调度表 =====================
+
+TOOL_HANDLERS = {
+    "scan_market":     lambda **kw: scan_market(**kw),
+    "backtest_signal": lambda **kw: backtest_signal(**kw),
+    "evaluate_result":   lambda **kw: evaluate_result(**kw),
+    "push_candidate":   lambda **kw: push_candidate(**kw),
+}
+
+
+def run_tool(name: str, arguments: dict) -> str:
+    handler = TOOL_HANDLERS.get(name)
+    if not handler:
+        return json.dumps({"ok": False, "error": f"Unknown tool: {name}"}, ensure_ascii=False)
+    try:
+        result = handler(**arguments)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+
+# ===================== TodoWrite 管理器（Layer 3）=====================
+
+class TodoManager:
+    def __init__(self):
+        self.items = []
+        self.rounds_since_update = 0
+
+    def update(self, items: list):
+        if sum(1 for it in items if it.get("status") == "in_progress") > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        self.items = items
+        self.rounds_since_update = 0
+
+    def tick(self):
+        self.rounds_since_update += 1
+
+    def should_nag(self) -> bool:
+        return self.rounds_since_update >= 3
+
+    def get_display(self) -> str:
+        if not self.items:
+            return "(no tasks)"
+        return "\n".join(
+            f"{ {'pending':'🔲','in_progress':'🔵','completed':'✅'}.get(it.get('status'),'⬜')} "
+            f"[{it.get('status')}] {it.get('content','')}"
+            for it in self.items
+        )
+
+
+# ===================== LLM 调用 =====================
+
+def call_llm(messages: list, model: str = MODEL) -> dict:
+    import urllib.request, urllib.error
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": MAX_TOKENS,
+    }
+
+    req = urllib.request.Request(
+        f"{MINIMAX_BASE_URL}/messages",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {MINIMAX_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "curl/7.81.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}: {e.read().decode()}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ===================== ReAct 文本解析 =====================
+
+TOOL_CALL_RE = re.compile(
+    r'<tool_call>\s*(\w+)\s*\(\s*(.*?)\s*\)\s*</tool_call>',
+    re.DOTALL
+)
+STOP_RE = re.compile(r'<stop\s*/?>', re.IGNORECASE)
+
+TOOL_DOC = """
+你可用的工具（直接调用，不要在思考里描述）：
+
+scan_market(phase: str, limit: int) -> candidates[]
+  - phase: "train"|"val"|"test"
+  - 返回成交量最高的候选股票列表
+
+backtest_signal(symbol: str, signal_type: str, params: dict, phase: str) -> result
+  - signal_type 可选：
+    # 已有信号
+    - "rsi": RSI超卖（params: rsi_thresh默认20, hold_days默认7）
+    - "bb_break": 布林下轨突破（params: bb_thresh默认1.0, hold_days默认7）
+    - "macd_goldCross": MACD金叉（params: hold_days默认7）
+    - "ma_cross": MA金叉（params: ma_short默认ma5, ma_long默认ma10, hold_days默认7）
+    - "bollinger_bounce": 布林下轨反弹（params: hold_days默认7）
+    - "volume_breakout": 放量突破（params: vol_mult默认1.5, hold_days默认7）
+    # KDJ系列
+    - "kdj_goldCross": KDJ金叉（K线上穿D线）（params: hold_days默认7）
+    - "kdj_oversold": KDJ超卖（params: kdj_thresh默认20, hold_days默认7）
+    # CCI
+    - "cci_oversold": CCI超卖（params: cci_thresh默认-100, hold_days默认7）
+    # WR威廉指标
+    - "wr_oversold": 威廉指标超卖（params: wr_thresh默认80, hold_days默认7）
+    # BIAS乖离率
+    - "bias_oversold": BIAS超卖（params: bias_period默认12, bias_thresh默认-5, hold_days默认7）
+    - "bias_rebound": BIAS反弹（从极低值回升）（params: bias_period默认12, bias_thresh默认-8, hold_days默认7）
+    # PSY心理线
+    - "psy_oversold": PSY超卖（params: psy_period默认12, psy_thresh默认25, hold_days默认7）
+    # VR容量比率
+    - "vr_oversold": VR超卖（params: vr_thresh默认70, hold_days默认7）
+    # DMA差分移动平均
+    - "dma_goldCross": DMA金叉（params: hold_days默认7）
+    # EXPMA指数平滑
+    - "expma_goldCross": EXPMA金叉（params: hold_days默认7）
+    # TEMA三重指数平滑
+    - "tema_goldCross": TEMA金叉（params: hold_days默认7）
+    # MACD信号增强
+    - "macd_hist_turn": MACD柱状图由负转正（params: hold_days默认7）
+    - "macd_divergence": MACD底背离（价格新低但DIF未新低）（params: hold_days默认7）
+    # 换手率
+    - "turnover_spike": 换手率突增（params: turnover_mult默认2.0, hold_days默认7）
+    # 成交量综合
+    - "volume_shrink": 地量（缩量到极致后反弹）（params: shrink_ratio默认0.3, hold_days默认7）
+    - "volume_mean_reversion": 均量线回归（量先跌后涨）（params: vol_period默认5, hold_days默认7）
+    # 多周期共振
+    - "rsi_ma_combo": RSI超卖+MA多头共振（params: rsi_thresh默认30, hold_days默认7）
+    - "kdj_macd_combo": KDJ金叉+MACD金叉共振（params: hold_days默认7）
+    # 趋势确认
+    - "adx_plusDI": ADX>20且+DI>-DI趋势确认（params: adx_thresh默认20, hold_days默认7）
+    # 支撑压力
+    - "price_support": 价格触及N日最低价支撑（params: n_days默认20, hold_days默认7）
+    - "price_resistance": 价格触及N日最高价压力（params: n_days默认20, hold_days默认7）
+  - params示例: {"rsi_thresh": 20, "hold_days": 7}
+  - 返回回测统计结果
+
+evaluate_result(result: dict) -> evaluation
+  - 评估回测结果是否达标
+
+push_candidate(candidate: dict)
+  - 推送三阶段全达标的策略到候选池
+
+停止探索：直接输出 <stop/>
+"""
+
+
+def parse_model_output(text: str) -> tuple[list[tuple], bool]:
+    """
+    解析模型输出中的工具调用和停止标记。
+    返回 ([(name, args_str), ...], should_stop)
+    """
+    calls = []
+    should_stop = bool(STOP_RE.search(text))
+    for m in TOOL_CALL_RE.finditer(text):
+        calls.append((m.group(1), m.group(2).strip()))
+    return calls, should_stop
+
+
+def parse_args(args_str: str) -> dict:
+    """简单解析 JSON 或 key=value 格式参数"""
+    args_str = args_str.strip()
+    if not args_str:
+        return {}
+    try:
+        return json.loads(args_str)
+    except Exception:
+        pass
+    # 解析 key=value, ... 格式
+    result = {}
+    for part in args_str.split(","):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if v.startswith("{") or v.startswith("["):
+                try:
+                    result[k] = json.loads(v)
+                except Exception:
+                    result[k] = v
+            elif v.startswith('"') or v.startswith("'"):
+                result[k] = v.strip('"\'')
+            elif v in ("True", "true"):
+                result[k] = True
+            elif v in ("False", "false"):
+                result[k] = False
+            elif v in ("None", "null"):
+                result[k] = None
+            else:
+                try:
+                    result[k] = int(v)
+                except Exception:
+                    try:
+                        result[k] = float(v)
+                    except Exception:
+                        result[k] = v
+        result[k] = v
+    return result
+
+
+# ===================== Agent Loop 主循环（Layer 1）=====================
+
+SYSTEM_PROMPT = f"""你是一个股票策略探索 Agent，目标是找到三阶段（训练/验证/测试）都能盈利的策略。
+
+规则：
+- 训练集选策略，验证/测试集只评估（不能调参）
+- A股 T+1：T日信号，T+1开盘买，持有N天后收盘卖
+- 目标：胜率≥55%，均益>0，信号数≥5
+
+工作方式（ReAct）：
+1. 你在思考中分析当前状态
+2. 决定下一步后，用 <tool_call>tool_name(args)</tool_call> 格式调用工具
+3. 工具结果会返回给你，继续分析
+4. 当你认为探索足够时，输出 <stop/>
+
+{TOOL_DOC}
+
+重要：
+- 先扫描训练集了解候选股票池
+- 分析候选股的指标区间/波动性，决定试哪只
+- 信号类型和参数组合由你决定
+- 三阶段都要评估，全达标才能 push_candidate
+"""
+
+
+def run_agent_loop(rounds: int = 20, model: str = None) -> dict:
+    todo_mgr = TodoManager()
+    todo_mgr.update([
+        {"content": "扫描市场候选股票池", "status": "in_progress"},
+        {"content": "分析候选股，选择信号类型和参数", "status": "pending"},
+        {"content": "三阶段回测，评估是否达标", "status": "pending"},
+        {"content": "达标策略推送候选池", "status": "pending"},
+    ])
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": f"""开始策略探索。
+
+当前 Todo：
+{todo_mgr.get_display()}
+
+数据库: {DB_PATH}
+三阶段：
+- 训练集: 2021-01-01 ~ 2024-06-30
+- 验证集: 2024-07-01 ~ 2025-07-01
+- 测试集: 2025-07-02 ~ 2026-03-24
+
+请开始：先扫描训练集市场候选股票。
+"""},
+    ]
+
+    candidates = []
+    round_num = 0
+    todo_updated_this_turn = False
+
+    print(f"\n{'='*60}")
+    print(f"🤖 Agent Backtest Loop | 模型: {model or MODEL} | 最多{rounds}轮")
+    print(f"{'='*60}\n")
+
+    while round_num < rounds:
+        round_num += 1
+        print(f"\n--- 第 {round_num}/{rounds} 轮 ---")
+
+        # Nag reminder
+        if todo_mgr.should_nag() and not todo_updated_this_turn:
+            nag = {"role": "user", "content": "<reminder>请更新 Todo 状态。你在做什么？进展如何？</reminder>"}
+            messages.append(nag)
+            print("   🔔 [Nag] 连续未更新 Todo，已注入提醒")
+
+        t0 = time.time()
+        resp = call_llm(messages, model=model or MODEL)
+        elapsed = time.time() - t0
+
+        if "error" in resp:
+            print(f"   ❌ LLM 错误: {resp['error']}")
+            break
+
+        # 提取文本内容
+        content = resp.get("content", [])
+        thinking = text = ""
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "thinking":
+                        thinking += block.get("text", "")
+                    elif block.get("type") == "text":
+                        text += block.get("text", "")
+        full_text = thinking + text
+
+        # 打印思考
+        display_thought = (thinking or text)[:400].replace("\n", " ")
+        print(f"   💭 {display_thought[:300]}...")
+
+        # 解析工具调用
+        tool_calls, should_stop = parse_model_output(full_text)
+        todo_updated_this_turn = False
+
+        if should_stop or not tool_calls:
+            print(f"   ✅ 模型结束（{'<stop/>' if should_stop else '无工具调用'}）")
+            break
+
+        # 执行工具
+        tool_results = []
+        for name, args_str in tool_calls:
+            args = parse_args(args_str)
+            print(f"   🔧 {name}({json.dumps(args, ensure_ascii=False)[:80]})")
+            result_str = run_tool(name, args)
+            result_obj = json.loads(result_str)
+
+            # 检查 update_todo
+            if name == "update_todo":
+                try:
+                    todo_mgr.update(args.get("todo", []))
+                    print(f"   📋 Todo: {todo_mgr.get_display()}")
+                    todo_updated_this_turn = True
+                except ValueError as ex:
+                    print(f"   ⚠️  Todo无效: {ex}")
+                    result_obj = {"ok": False, "error": str(ex)}
+
+            # 检查 push_candidate
+            if name == "push_candidate" and result_obj.get("ok"):
+                cand = args.get("candidate", {})
+                candidates.append(cand)
+                print(f"   🎉 入池！累计 {len(candidates)} 个达标策略")
+
+            print(f"   ← {result_str[:200]}")
+            tool_results.append({"role": "user", "content": result_str})
+
+        messages.append({"role": "assistant", "content": full_text})
+        messages.extend(tool_results)
+
+        if not todo_updated_this_turn:
+            todo_mgr.tick()
+
+        print(f"   ⏱️  {elapsed:.1f}秒 | 达标: {len(candidates)}个")
+
+    print(f"\n{'='*60}")
+    print(f"🏁 结束 | {round_num}轮 | 达标: {len(candidates)}个")
+    print(f"{'='*60}\n")
+
+    for i, c in enumerate(candidates, 1):
+        print(f"  {i}. {c.get('symbol')} | {c.get('signal_type')} {c.get('params')}")
+        for ph in ("train", "val", "test"):
+            p = c.get(ph, {})
+            print(f"     {ph}: 胜率{p.get('win_rate','?')}% 均益{p.get('avg_return','?')}%")
+
+    return {"ok": True, "rounds": round_num, "candidates": candidates}
+
+
+# ===================== 入口 =====================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--model",  type=str,  default=None)
+    args = parser.parse_args()
+
+    t0 = time.time()
+    result = run_agent_loop(rounds=args.rounds, model=args.model)
+    print(f"\n总耗时: {time.time()-t0:.1f}秒")

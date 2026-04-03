@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#58a6ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="股票盯盘">
+<meta name="description" content="实时股票盯盘、策略回测、风险分析系统">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="format-detection" content="telephone=no">
+
+<title>📈 股票盯盘</title>
+
+<!-- PWA Manifest -->
+<link rel="manifest" href="/static/manifest.json">
+<link rel="icon" type="image/png" href="/static/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icons/icon-152.png">
+
+<!-- Styles -->
+<link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+<div class="container">
+  <!-- 顶部导航 -->
+  <nav class="top-nav">
+    <div class="logo">📈 股票盯盘</div>
+    
+    <!-- 全局搜索 -->
+    <div class="search-container">
+      <span class="search-icon">🔍</span>
+      <input type="text" id="globalSearch" class="search-input" placeholder="搜索股票代码/名称（如 002149 或 贵州茅台）..." autocomplete="off">
+      <div id="searchResults" class="search-results"></div>
+    </div>
+    
+    <!-- 状态指示器 -->
+    <div class="status-indicator">
+      <div id="statusDot" class="status-dot"></div>
+      <span id="statusText">连接中...</span>
+      <span style="margin-left:8px;font-size:11px">
+        <span id="wsStatusDot" class="ws-status-dot disconnected" style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px"></span>
+        <span id="wsStatusText" style="color:#8b949e">实时连接</span>
+      </span>
+    </div>
+  </nav>
+  
+  <!-- Tab 导航 -->
+  <nav class="tab-nav" role="tablist">
+    <button class="tab-btn active" data-tab="dashboard" role="tab" aria-selected="true">🏠 总览</button>
+    <button class="tab-btn" data-tab="watchlist" role="tab" aria-selected="false">📋 股票</button>
+    <button class="tab-btn" data-tab="strategies" role="tab" aria-selected="false">⚙️ 策略</button>
+    <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false">🔔 告警</button>
+    <button class="tab-btn" data-tab="db" role="tab" aria-selected="false">🗄️ 数据库</button>
+  </nav>
+  
+  <!-- 面包屑导航 -->
+  <div id="breadcrumb" class="breadcrumb" style="display:none"></div>
+  
+  <!-- Tab 内容区 -->
+  <main>
+    <!-- 总览 Dashboard -->
+    <div id="tab-dashboard" class="tab-content active" role="tabpanel">
+      <div id="dashboardContent"></div>
+    </div>
+
+    <!-- 股票（自选股 + 详情） -->
+    <div id="tab-watchlist" class="tab-content hidden" role="tabpanel">
+      <div id="watchlistContent"></div>
+    </div>
+    
+    <!-- 策略管理 -->
+    <div id="tab-strategies" class="tab-content hidden" role="tabpanel">
+      <div id="strategiesContent"></div>
+    </div>
+    
+    <!-- 告警历史 -->
+    <div id="tab-alerts" class="tab-content hidden" role="tabpanel">
+      <div id="alertsContent"></div>
+    </div>
+
+    <!-- 数据库查询 -->
+    <div id="tab-db" class="tab-content hidden" role="tabpanel">
+      <div id="dbContent"></div>
+    </div>
+  </main>
+  
+  <!-- 股票详情模态框（K线图 + 基本面） -->
+  <div id="stockDetailModal" class="modal" style="display:none" onclick="if(event.target===this)Watchlist.closeStockDetail()">
+    <div class="modal-content" style="max-width:1100px;width:95%;max-height:90vh;overflow-y:auto">
+      <div class="modal-header">
+        <span id="stockDetailTitle">股票详情</span>
+        <button class="btn btn-sm btn-secondary" onclick="Watchlist.closeStockDetail()">✕</button>
+      </div>
+      <div id="stockDetailBody"></div>
+    </div>
+  </div>
+
+  <!-- 页脚 -->
+  <footer style="text-align:center;padding:20px;color:#8b949e;font-size:12px">
+    股票盯盘系统 · 数据来源于腾讯财经 · 仅供参考，不构成投资建议
+  </footer>
+</div>
+
+<!-- 脚本 -->
+<script src="/static/js/utils.js"></script>
+<script src="/static/js/vendor/socket.io.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@5.1.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="/static/js/app.js"></script>
+<script src="/static/js/dashboard.js"></script>
+
+<script src="/static/js/watchlist.js"></script>
+<script src="/static/js/strategies.js"></script>
+<script src="/static/js/alerts.js"></script>
+<script src="/static/js/dbquery.js"></script>
+
+<!-- Service Worker Registration -->
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/static/service-worker.js')
+      .then((registration) => {
+        console.log('SW registered:', registration.scope);
+        // Listen for updates
+        registration.addEventListener('updatefound', () => {
+          const newWorker = registration.installing;
+          newWorker.addEventListener('statechange', () => {
+            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+              // New version available
+              showUpdateBanner();
+            }
+          });
+        });
+      })
+      .catch((err) => {
+        console.error('SW registration failed:', err);
+      });
+
+    // Listen for messages from service worker
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      if (event.data && event.data.type === 'STOCK_UPDATE') {
+        console.log('Received stock update from SW');
+      }
+    });
+  });
+}
+
+// PWA Install Prompt
+let deferredPrompt;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  showInstallBanner();
+});
+
+function showInstallBanner() {
+  let banner = document.querySelector('.pwa-install-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.className = 'pwa-install-banner';
+    banner.innerHTML = `
+      <p>📱 安装股票盯盘到主屏幕，随时查看行情！</p>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-secondary" onclick="dismissInstall()">暂不</button>
+        <button class="btn btn-primary" onclick="installPWA()">安装</button>
+      </div>
+    `;
+    document.body.appendChild(banner);
+  }
+  setTimeout(() => banner.classList.add('show'), 100);
+}
+
+function dismissInstall() {
+  const banner = document.querySelector('.pwa-install-banner');
+  if (banner) {
+    banner.classList.remove('show');
+    setTimeout(() => banner.remove(), 300);
+  }
+}
+
+function installPWA() {
+  if (deferredPrompt) {
+    deferredPrompt.prompt();
+    deferredPrompt.userChoice.then((choiceResult) => {
+      console.log('PWA install choice:', choiceResult.outcome);
+      deferredPrompt = null;
+      dismissInstall();
+    });
+  }
+}
+
+function showUpdateBanner() {
+  const banner = document.createElement('div');
+  banner.className = 'offline-banner show';
+  banner.style.background = 'var(--accent-blue)';
+  banner.style.color = '#fff';
+  banner.innerHTML = '✨ 新版本可用 <button class="btn btn-sm" style="background:#fff;color:#333;margin-left:8px" onclick="location.reload()">刷新</button>';
+  document.body.prepend(banner);
+}
+</script>
+</body>
+</html>

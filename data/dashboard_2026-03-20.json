@@ -1,0 +1,53 @@
+{
+  "date": "2026-03-20",
+  "market_regime": "均衡",
+  "market_score": -0.2,
+  "items": [
+    {
+      "symbol": "sh600519",
+      "name": "sh600519(白酒Ⅱ)",
+      "signal": "买入",
+      "trend": "强势多头",
+      "price": 1436.37,
+      "buy_price": 1436.37,
+      "stop_loss": 1364.55,
+      "target": 1580.01,
+      "rsi": 51.51,
+      "reasons": [
+        "强势多头"
+      ],
+      "news_sentiment": null
+    },
+    {
+      "symbol": "sz002149",
+      "name": "sz002149(小金属)",
+      "signal": "卖出",
+      "trend": "空头排列",
+      "price": 43.23,
+      "buy_price": 43.23,
+      "stop_loss": 41.07,
+      "target": 47.55,
+      "rsi": 34.63,
+      "reasons": [
+        "空头排列"
+      ],
+      "news_sentiment": null
+    },
+    {
+      "symbol": "sh601318",
+      "name": "sh601318(保险Ⅱ)",
+      "signal": "卖出",
+      "trend": "强势空头",
+      "price": 60.31,
+      "buy_price": 60.31,
+      "stop_loss": 57.29,
+      "target": 66.34,
+      "rsi": 28.71,
+      "reasons": [
+        "强势空头",
+        "RSI29超卖"
+      ],
+      "news_sentiment": null
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  stock-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock-monitor-app
+    ports:
+      - "3001:3001"
+    volumes:
+      # Persist SQLite database and logs
+      - stock_data:/app/data
+      - stock_logs:/app/logs
+    environment:
+      - PORT=3001
+      - DB_PATH=/app/data/stock_data.db
+      - DEBUG=false
+      - CORS_ORIGINS=*
+      - STOCK_SYMBOL=sz002149
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  stock_data:
+    driver: local
+  stock_logs:
+    driver: local

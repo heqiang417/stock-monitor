@@ -1,0 +1,109 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Large data files
+stock_data_full.json
+download_progress.json
+pending_alerts.json
+
+# Backtest & test reports
+*_results.json
+*_report.md
+*_summary.md
+backfill_*.txt
+data/failed_*.txt
+
+# Dev scripts (keep only essential ones)
+adx_*.py
+aggregate_*.py
+backfill_*.py
+backtest_*.py
+download_capital_flow.py
+fetch_*.py
+fill_*.py
+full_*.py
+fundamental_*.py
+high_*.py
+new_strategy_*.py
+run_*.py
+scripts/backfill_*.py
+
+# Pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Flask instance
+instance/
+
+# Node (for static assets if any)
+node_modules/
+
+# Secret key
+.secret_key
+
+# Backup files
+*.bak
+*.tar.gz
+*.tar.gz
+*.db-shm
+*.db-wal
+
+# 整理后新增
+logs/*.log
+logs/*.log.*
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+data/results/agent_candidates.jsonl

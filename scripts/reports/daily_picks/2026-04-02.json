@@ -1,0 +1,44 @@
+{
+  "date": "2026-04-02",
+  "strategies": {
+    "Fstop3_pt5_v10": {
+      "picks": [
+        {
+          "symbol": "sh688287",
+          "close": 2.48,
+          "rsi": 15.02,
+          "bb": 2.685,
+          "vol_ratio": 1.58,
+          "fund_score": 24.2
+        }
+      ]
+    },
+    "BB1.00": {
+      "picks": [
+        {
+          "symbol": "sz300926",
+          "close": 24.52,
+          "rsi": 14.08,
+          "bb": 25.6,
+          "fund_score": 75.4
+        }
+      ]
+    },
+    "BB0.99": {
+      "picks": [
+        {
+          "symbol": "sz300926",
+          "close": 24.52,
+          "rsi": 14.08,
+          "bb": 25.6,
+          "fund_score": 75.4
+        }
+      ]
+    }
+  },
+  "market": {
+    "weak_pct": 77.2,
+    "market_ok_50": true,
+    "market_ok_70": true
+  }
+}
