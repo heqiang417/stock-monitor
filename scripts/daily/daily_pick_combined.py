@@ -321,7 +321,7 @@ elements = [
 
 # Fstop3 v10 - reference metrics from v4 framework eval
 elements += build_section(
-    title="策略1️⃣ Fstop3_pt5（参考历史）",
+    title="策略1️⃣ Fstop3_pt5（RSI<18 + BB触底 + 放量1.5x + 弱市50%）",
     picks=picks_v10,
     cond_md="回测参考：三阶段胜率 58.6%/89.0%/68.4% | 夏普 2.92/2.32/3.90",
     note_md="建议：T+1开盘买 | 止损3%止盈5% | 持有个≤10天了结",
@@ -329,21 +329,21 @@ elements += build_section(
 )
 # BB1.00 - framework eval metrics
 elements += build_section(
-    title="策略2️⃣ BB1.00（⭐ 推荐）",
+    title="策略2️⃣ BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
     picks=picks_b1,
     cond_md="回测：三阶段胜率 57.7%/74.7%/69.2% | 夏普 1.43/3.76/3.26 | 测试52笔",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
 )
 # BB1.02+KDJ - framework eval metrics
 elements += build_section(
-    title="策略3️⃣ BB1.02+KDJ（⭐ 推荐）",
+    title="策略3️⃣ BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
     picks=picks_kdj,
     cond_md="回测：三阶段胜率 56.9%/67.0%/63.6% | 夏普 1.33/2.76/2.59 | 测试187笔",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
 )
 # BB0.99 - framework eval metrics
 elements += build_section(
-    title="策略4️⃣ BB0.99",
+    title="策略4️⃣ BB0.99（RSI<20 + BB≤0.99 + 弱市70% + 7天持有）",
     picks=picks_b099,
     cond_md="回测：三阶段胜率 61.1%/81.4%/64.5% | 夏普 1.98/4.49/2.67 | 测试31笔",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
