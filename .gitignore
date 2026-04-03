@@ -56,12 +56,20 @@ stock_data_full.json
 download_progress.json
 pending_alerts.json
 
-# Backtest & test reports
+# 评估输出（临时，每次评估都重新生成）
+evaluate_result.json
+evaluate_result.md
+
+# 回测 & 测试报告（只在数据目录，不包括 docs/ 下的策略文档）
 *_results.json
-*_report.md
 *_summary.md
+data/**/*_report.md
+data/**/*_summary.json
 backfill_*.txt
 data/failed_*.txt
+
+# 每日推送记录
+reports/daily_picks/*.json
 
 # Dev scripts (keep only essential ones)
 adx_*.py
@@ -106,4 +114,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
+
+# data/results/ — 只保留最终策略结果文件夹，临时探索结果不提交
+data/results/
+!data/results/Fstop3_pt5_v10/
+!data/results/BB_KDJ_Weak/
+!data/results/RSI20_BB_hold7_TOP300/
+!data/results/RSI20_BB_hold7_TOP500/
+!data/results/best_RSI20_weak80/
+!data/results/best_RSI<20_weak80%/
 data/results/agent_candidates.jsonl
