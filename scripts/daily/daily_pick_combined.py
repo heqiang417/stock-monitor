@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 每日选股 - 策略组合包
-包含四个策略：
+包含三个策略：
   1. Fstop3_pt5 v10：RSI<18 + BB触底 + 放量1.5x + 弱市50%
   2. BB1.00：RSI<20 + BB<=1.00 + 弱市70% + 7天持有
-  4. BB1.02+KDJ Oversold
-  4. BB0.99：RSI<20 + BB<=0.99 + 弱市70% + 7天持有
+  3. BB1.02+KDJ Oversold：RSI<20 + BB<=1.02 + KDJ超卖 + 弱市70% + TOP500
 用法: python3 daily_pick_combined.py [--date 2026-04-02] [--push]
 """
 import sqlite3, json, subprocess, os, argparse, time, requests
@@ -243,13 +242,6 @@ print(f"候选: {len(picks_kdj)} 只")
 for p in picks_kdj:
     print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
 
-# === 策略4: BB0.99 ===
-print(f"\n=== BB0.99 ===")
-picks_b099, _ = run_strategy("BB0.99", 20, 0.99, 70, False, 300, market_ok_70)
-print(f"候选: {len(picks_b099)} 只")
-for p in picks_b099:
-    print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
-
 # === 历史记录 ===
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'reports', 'daily_picks')
 os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -259,7 +251,6 @@ result_record = {
         "Fstop3_pt5_v10": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_v10]},
         "BB1.00": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b1]},
         "BB1.02_KDJ": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_kdj]},
-        "BB0.99": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b099]},
     },
     "market": {"weak_pct": round(weak_pct, 1), "market_ok_50": market_ok_50, "market_ok_70": market_ok_70}
 }
@@ -313,7 +304,7 @@ def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False):
     ]
 
 elements = [
-    {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 四策略组合**"}},
+    {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 三策略组合**"}},
     {"tag": "hr"},
     {"tag": "div", "text": {"tag": "lark_md", "content": f"🟢 大盘弱市 {weak_pct:.1f}%（需50%:{'✅' if market_ok_50 else '❌'} | 需70%:{'✅' if market_ok_70 else '❌'}）"}},
     {"tag": "hr"},
@@ -341,15 +332,9 @@ elements += build_section(
     cond_md="回测：三阶段胜率 56.9%/67.0%/63.6% | 夏普 1.33/2.76/2.59 | 测试187笔",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
 )
-# BB0.99 - framework eval metrics
-elements += build_section(
-    title="策略4️⃣ BB0.99（RSI<20 + BB≤0.99 + 弱市70% + 7天持有）",
-    picks=picks_b099,
-    cond_md="回测：三阶段胜率 61.1%/81.4%/64.5% | 夏普 1.98/4.49/2.67 | 测试31笔",
-    note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
-)
 
-elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 四策略组合 | 不构成投资建议"}]})
+
+elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 三策略组合 | 不构成投资建议"}]})
 
 card = {"elements": elements}
 
