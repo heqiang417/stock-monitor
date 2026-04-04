@@ -439,15 +439,6 @@ def main():
         # 2. 技术指标重算（始终执行，K线更新后必须重算）
         recalc_technical_indicators()
 
-        # 2.5 日K线+技术指标就绪，立即校验并写 flag 文件（供 daily_pick 监听）
-        post_sync_validate()
-        try:
-            with open(READY_FLAG, 'w') as f:
-                f.write(TODAY)
-            log(f"  🏁 就绪信号已写入: {READY_FLAG} ({TODAY})")
-        except Exception as e:
-            log(f"  ⚠️ 写入就绪信号失败: {e}")
-
         # 3. 周K线（--no-weekly 时跳过，仅周日全量跑）
         if not args.no_weekly:
             sync_weekly_kline()
@@ -463,12 +454,17 @@ def main():
         if args.full:
             sync_financial_indicators()
 
-    # 最终校验（估值等也完成后）
-    if not only_fund:
-        post_sync_validate()
+        # 7. 增量算今天布林带（必须在 READY_FLAG 之前完成）
+        _calc_today_bollinger()
 
-    # 增量算今天布林带
-    _calc_today_bollinger()
+        # 最终校验（布林带算完后才发就绪信号，供 daily_pick 监听）
+        post_sync_validate()
+        try:
+            with open(READY_FLAG, 'w') as f:
+                f.write(TODAY)
+            log(f"  🏁 就绪信号已写入: {READY_FLAG} ({TODAY})")
+        except Exception as e:
+            log(f"  ⚠️ 写入就绪信号失败: {e}")
 
     elapsed = time.time() - start_time
     log(f"同步完成! 耗时: {elapsed:.1f}秒 ({elapsed/60:.1f}分钟)")

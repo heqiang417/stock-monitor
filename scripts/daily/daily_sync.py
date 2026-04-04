@@ -31,7 +31,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # 添加项目根目录到 Python 路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> 项目根
+sys.path.insert(0, _project_root)
+# 也支持从 /mnt/data 路径调用
+sys.path.insert(0, '/mnt/data/workspace/stock-monitor-app-py')
 from data_provider import DataFetcherManager
 from data_provider.tencent_fetcher import TencentFetcher
 from data_provider.akshare_fetcher import AkshareFetcher
@@ -422,7 +425,8 @@ def sync_valuation():
 # 7. 资金流向更新
 # ============================================================
 def sync_capital_flow():
-    log("=== 同步资金流向 ===")
+    """资金流向全量同步：并发获取所有历史记录，批量写入，速度快"""
+    log("=== 同步资金流向（全量批量）===")
     try:
         import akshare as ak
     except ImportError:
@@ -433,58 +437,71 @@ def sync_capital_flow():
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
     conn.close()
 
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    success = 0
+    BATCH = 500  # 每500只写一次DB
+    all_rows = []  # 收集所有待写入记录
     db_lock = threading.Lock()
+    done_count = [0]  # 用列表方便在内层修改
 
-    def fetch_flow(symbol):
+    def fetch_all_history(symbol):
+        """获取该股全部历史资金流向，返回多条记录"""
         code = symbol[2:]
         market = 'sh' if symbol.startswith('sh') else 'sz'
         try:
             df = ak.stock_individual_fund_flow(stock=code, market=market)
             if df is None or df.empty:
-                return None
-            latest = df.iloc[-1]
-            return {
-                'symbol': symbol,
-                'trade_date': str(latest.get('日期', today_str)),
-                # akshare 返回单位是元，转万元（与 download_capital_flow.py 保持一致）
-                'main_net_inflow': float(latest.get('主力净流入-净额', 0) or 0) / 10000.0,
-                'super_large_net_inflow': float(latest.get('超大单净流入-净额', 0) or 0) / 10000.0,
-                'large_net_inflow': float(latest.get('大单净流入-净额', 0) or 0) / 10000.0,
-                'medium_net_inflow': float(latest.get('中单净流入-净额', 0) or 0) / 10000.0,
-                'small_net_inflow': float(latest.get('小单净流入-净额', 0) or 0) / 10000.0,
-            }
+                return []
+            rows = []
+            for _, row in df.iterrows():
+                rows.append((
+                    symbol,
+                    str(row.get('日期', '')),
+                    float(row.get('主力净流入-净额', 0) or 0) / 10000.0,
+                    float(row.get('超大单净流入-净额', 0) or 0) / 10000.0,
+                    float(row.get('大单净流入-净额', 0) or 0) / 10000.0,
+                    float(row.get('中单净流入-净额', 0) or 0) / 10000.0,
+                    float(row.get('小单净流入-净额', 0) or 0) / 10000.0,
+                ))
+            return rows
         except:
-            return None
+            return []
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(fetch_flow, s): s for s in symbols}
-        done = 0
-        for f in as_completed(futures, timeout=600):
+    def write_batch(rows):
+        if not rows:
+            return
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.executemany('''INSERT OR REPLACE INTO capital_flow
+            (symbol, trade_date, main_net_inflow, super_large_net_inflow,
+             large_net_inflow, medium_net_inflow, small_net_inflow)
+            VALUES (?,?,?,?,?,?,?)''', rows)
+        conn.commit()
+        conn.close()
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_all_history, s): s for s in symbols}
+        batch = []
+        for f in as_completed(futures):
             try:
-                data = f.result(timeout=10)
+                rows = f.result(timeout=15)
             except:
-                data = None
-            if data:
+                rows = []
+            if rows:
+                batch.extend(rows)
+            done_count[0] += 1
+            if done_count[0] % 500 == 0:
+                log(f"  资金流向进度: {done_count[0]}/{len(symbols)}")
+            # 凑够BATCH条就写入
+            if len(batch) >= BATCH:
                 with db_lock:
-                    conn = sqlite3.connect(DB_PATH)
-                    conn.execute('PRAGMA journal_mode=WAL')
-                    conn.execute('''INSERT OR REPLACE INTO capital_flow
-                        (symbol, trade_date, main_net_inflow, super_large_net_inflow,
-                         large_net_inflow, medium_net_inflow, small_net_inflow)
-                        VALUES (?,?,?,?,?,?,?)''',
-                        (data['symbol'], data['trade_date'], data['main_net_inflow'],
-                         data['super_large_net_inflow'], data['large_net_inflow'],
-                         data['medium_net_inflow'], data['small_net_inflow']))
-                    conn.commit()
-                    conn.close()
-                success += 1
-            done += 1
-            if done % 200 == 0:
-                log(f"  资金流向进度: {done}/{len(symbols)}")
+                    write_batch(batch)
+                batch = []
+        # 剩余的写完
+        if batch:
+            with db_lock:
+                write_batch(batch)
 
-    log(f"  资金流向完成: 更新{success}只")
+    log(f"  资金流向完成: 处理{done_count[0]}只")
 
 # ============================================================
 # 8. 行业板块更新
