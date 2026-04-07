@@ -1,0 +1,17 @@
+# BB1.00 策略参数配置
+version: "bb100"
+
+# 选股参数
+rsi_threshold: 20
+bb_mult: 1.00
+vol_required: false
+weak_pct: 70
+top_n: 300
+
+# 卖出参数
+hold_days: 7
+sell_mode: "no_stop"     # 不设止损止盈，持有7天
+
+# 评估用
+eval_trades_file: "/home/heqiang/.openclaw/workspace/backtest/trades_v10_BB1.00.json"
+eval_result_file: "/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results/bb100_full_28metrics.json"

@@ -1,0 +1,18 @@
+# BB1.02+KDJ Oversold 策略参数配置
+version: "bb102_kdj"
+
+# 选股参数
+rsi_threshold: 20
+bb_mult: 1.02
+kdj_filter: true        # KDJ超卖过滤
+vol_required: false
+weak_pct: 70
+top_n: 500
+
+# 卖出参数
+hold_days: 7
+sell_mode: "no_stop"
+
+# 评估用
+eval_trades_file: "/home/heqiang/.openclaw/workspace/backtest/trades_v10_BB1.02_KDJ.json"
+eval_result_file: "/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results/weak_filter_compare.json"

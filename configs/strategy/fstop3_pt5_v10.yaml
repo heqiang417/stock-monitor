@@ -1,0 +1,27 @@
+# Fstop3_pt5 v10 策略参数配置
+# 所有策略参数集中管理，推送和回测都读此文件
+version: "fstop3_pt5_v10"
+
+# 选股参数
+rsi_threshold: 18
+bb_mult: 1.0          # close <= boll_lower * bb_mult
+vol_ratio: 1.5         # 放量倍数
+vol_required: true     # 是否需要放量
+weak_pct: 50          # 弱市阈值（%个股<MA20）
+top_n: 0               # 0=不限，300=TOP300
+
+# 卖出参数
+stop_loss: 3.0         # 止损%
+take_profit: 5.0       # 止盈%
+hold_days: 10          # 最多持有天数
+sell_mode: "stop_profit"  # stop_profit=止损止盈模式
+
+# 评估用（用于推送文案一致性校验）
+eval_trades_file: "/home/heqiang/.openclaw/workspace/backtest/trades_v10_Fstop3_pt5.json"
+eval_result_file: "/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results/fstop3_v10_framework_eval.json"
+
+# 三阶段区间
+phases:
+  train: ["2021-01-01", "2024-06-30"]
+  val:   ["2024-07-01", "2025-07-01"]
+  test:  ["2025-07-02", "2026-03-27"]

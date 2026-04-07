@@ -10,6 +10,136 @@
 import sqlite3, json, subprocess, os, argparse, time, requests
 from datetime import datetime, timedelta
 from collections import defaultdict
+import sys
+
+# 动态加载策略一致性校验（推送前查评估结果）
+def load_strategy_metrics():
+    """返回策略key->显示字符串的字典，无评估文件时返回None走降级"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    checker_path = os.path.join(script_dir, 'check_strategy_consistency.py')
+    cfg_dir = os.path.join(script_dir, '..', 'configs', 'strategy')
+    results_dir = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results'
+
+    # 直接读取评估JSON（不依赖子进程）
+    metrics = {}
+
+    # Fstop3（强制对齐最新 eval 真源）
+    r_file = os.path.join(results_dir, 'fstop3_v10_framework_eval.json')
+    if os.path.exists(r_file):
+        try:
+            with open(r_file, 'r', encoding='utf-8') as f:
+                r = json.load(f)
+            rs = r.get('results', {})
+            train_m = rs.get('train', {}).get('metrics', {})
+            val_m = rs.get('val', {}).get('metrics', {})
+            test_m = rs.get('test', {}).get('metrics', {})
+            has_core = all(
+                isinstance(m, dict) and ('positive_rate' in m) and ('sharpe' in m) and ('total_trades' in m)
+                for m in [train_m, val_m, test_m]
+            )
+            if has_core:
+                metrics['Fstop3_pt5_v10'] = (
+                    f"三阶段胜率 {train_m.get('positive_rate',0):.1f}%/"
+                    f"{val_m.get('positive_rate',0):.1f}%/"
+                    f"{test_m.get('positive_rate',0):.1f}% | "
+                    f"夏普 {train_m.get('sharpe',0):.2f}/"
+                    f"{val_m.get('sharpe',0):.2f}/"
+                    f"{test_m.get('sharpe',0):.2f} | "
+                    f"笔数 {int(train_m.get('total_trades',0))}/"
+                    f"{int(val_m.get('total_trades',0))}/"
+                    f"{int(test_m.get('total_trades',0))}"
+                )
+            else:
+                print("[Fstop3指标加载失败] eval 缺少核心字段，已降级⚠️", flush=True)
+        except Exception as e:
+            print(f"[Fstop3指标加载失败] {e}", flush=True)
+            pass
+
+    # BB1.00
+    r_file = os.path.join(results_dir, 'bb100_full_28metrics.json')
+    if os.path.exists(r_file):
+        try:
+            r = json.load(open(r_file))
+            pp = r.get('per_phase', {})
+            tr, va, te = pp.get('train', {}), pp.get('val', {}), pp.get('test', {})
+            if te:
+                n = te.get('total_trades', 0)
+                metrics['BB1.00'] = (
+                    f"三阶段胜率 {tr.get('positive_rate',0):.1f}%/{va.get('positive_rate',0):.1f}%/"
+                    f"{te.get('positive_rate',0):.1f}% | "
+                    f"夏普 {tr.get('sharpe',0):.2f}/{va.get('sharpe',0):.2f}/{te.get('sharpe',0):.2f}"
+                    + (f" | 测试{n}笔" if n else "")
+                )
+        except Exception as e:
+            print(f"[BB1.00指标加载失败] {e}", flush=True)
+            pass
+
+    # BB1.02+KDJ（从weak_filter_compare.json，取BB1.02_H7_TOP500_weakwidth70）
+    r_file = os.path.join(results_dir, 'weak_filter_compare.json')
+    if os.path.exists(r_file):
+        try:
+            r = json.load(open(r_file))
+            entry = next((v for k, v in r.items()
+                          if 'BB1.02_H7_TOP500' in k and 'weakwidth70' in k), None)
+            if entry:
+                pp = entry.get('results', {})
+                tr, va, te = pp.get('train', {}).get('metrics', {}), \
+                             pp.get('val', {}).get('metrics', {}), \
+                             pp.get('test', {}).get('metrics', {})
+                if te:
+                    n = te.get('total_trades', 0)
+                    metrics['BB1.02_KDJ'] = (
+                        f"三阶段胜率 {tr.get('positive_rate',0):.1f}%/{va.get('positive_rate',0):.1f}%/"
+                        f"{te.get('positive_rate',0):.1f}% | "
+                        f"夏普 {tr.get('sharpe',0):.2f}/{va.get('sharpe',0):.2f}/{te.get('sharpe',0):.2f}"
+                        + (f" | 测试{n}笔" if n else "")
+                    )
+        except Exception as e:
+            print(f"[BB1.02_KDJ指标加载失败] {e}", flush=True)
+            pass
+
+    return metrics
+
+def load_strategy_qualified():
+    """按统一标准判断策略是否合格：三阶段正收益率>55% 且 测试笔数>=30"""
+    results_dir = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results'
+    q = {}
+
+    # Fstop3
+    try:
+        r = json.load(open(os.path.join(results_dir, 'fstop3_v10_framework_eval.json')))
+        tr = r['results']['train']['metrics']; va = r['results']['val']['metrics']; te = r['results']['test']['metrics']
+        q['Fstop3_pt5_v10'] = (tr.get('positive_rate', 0) > 55 and va.get('positive_rate', 0) > 55 and te.get('positive_rate', 0) > 55 and te.get('total_trades', 0) >= 30)
+    except Exception:
+        q['Fstop3_pt5_v10'] = False
+
+    # BB1.00
+    try:
+        r = json.load(open(os.path.join(results_dir, 'bb100_full_28metrics.json')))
+        pp = r.get('per_phase', {})
+        tr, va, te = pp.get('train', {}), pp.get('val', {}), pp.get('test', {})
+        q['BB1.00'] = (tr.get('positive_rate', 0) > 55 and va.get('positive_rate', 0) > 55 and te.get('positive_rate', 0) > 55 and te.get('total_trades', 0) >= 30)
+    except Exception:
+        q['BB1.00'] = False
+
+    # BB1.02_KDJ
+    try:
+        r = json.load(open(os.path.join(results_dir, 'weak_filter_compare.json')))
+        entry = next((v for k, v in r.items() if 'BB1.02_H7_TOP500' in k and 'weakwidth70' in k), None)
+        pp = entry.get('results', {}) if entry else {}
+        tr = pp.get('train', {}).get('metrics', {})
+        va = pp.get('val', {}).get('metrics', {})
+        te = pp.get('test', {}).get('metrics', {})
+        q['BB1.02_KDJ'] = (tr.get('positive_rate', 0) > 55 and va.get('positive_rate', 0) > 55 and te.get('positive_rate', 0) > 55 and te.get('total_trades', 0) >= 30)
+    except Exception:
+        q['BB1.02_KDJ'] = False
+
+    return q
+
+STRATEGY_METRICS = load_strategy_metrics()
+STRATEGY_QUALIFIED = load_strategy_qualified()
+qualified_count = sum(1 for v in STRATEGY_QUALIFIED.values() if v)
+print(f"[策略指标加载] 成功 {len(STRATEGY_METRICS)}个策略 | 合格 {qualified_count}个")
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--date', default=None)
@@ -23,6 +153,7 @@ READY_FLAG = '/tmp/stock_data_ready.flag'
 TODAY = datetime.now().strftime('%Y-%m-%d')
 MIN_STOCKS = 4000
 VALID_LOOKBACK_DAYS = 10
+STRATEGY_VERSION = "combined-v1.1"
 
 db = sqlite3.connect(DB_PATH)
 db.execute('PRAGMA journal_mode=WAL')
@@ -87,6 +218,23 @@ if not args.date:
             latest = fallback
 
 # === 数据校验 ===
+def get_latest_trade_date(db):
+    row = db.execute("SELECT MAX(trade_date) FROM kline_daily").fetchone()
+    return row[0] if row and row[0] else None
+
+def get_trade_day_gap(db, from_date, to_date):
+    if not from_date or not to_date:
+        return None
+    row = db.execute(
+        """
+        SELECT COUNT(DISTINCT trade_date)
+        FROM kline_daily
+        WHERE trade_date > ? AND trade_date <= ?
+        """,
+        (from_date, to_date)
+    ).fetchone()
+    return row[0] if row else None
+
 def validate(db, date):
     errors = []
     total = db.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{date}'").fetchone()[0]
@@ -106,6 +254,11 @@ if errors:
     db.close()
     exit(1)
 print(f"数据校验通过 ({latest}): K线{stats['total']} RSI{stats['rsi']} BB{stats['bb']}")
+
+latest_trade = get_latest_trade_date(db)
+stale_trade_days = get_trade_day_gap(db, latest, latest_trade) if latest_trade else None
+if stale_trade_days and stale_trade_days > 0:
+    print(f"⚠️ 数据滞后: 目标日 {latest}，数据库最新交易日 {latest_trade}，差 {stale_trade_days} 个交易日")
 
 # === 市场宽度 ===
 m = db.execute(f"""
@@ -241,47 +394,64 @@ def run_strategy(name, rsi_thresh, bb_mult, weak_thresh, vol_required, topn, mar
 
 # === 策略1: Fstop3_pt5 v10 ===
 print(f"\n=== Fstop3_pt5 v10 ===")
-picks_v10, _ = run_strategy("Fstop3_pt5", 18, 1.0, 50, True, 0, market_ok_50)
-print(f"候选: {len(picks_v10)} 只")
-for p in picks_v10:
-    print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f} vol_ratio={p[4]:.2f}x")
+if STRATEGY_QUALIFIED.get('Fstop3_pt5_v10', False):
+    picks_v10, _ = run_strategy("Fstop3_pt5", 18, 1.0, 50, True, 0, market_ok_50)
+    print(f"候选: {len(picks_v10)} 只")
+    for p in picks_v10:
+        print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f} vol_ratio={p[4]:.2f}x")
+else:
+    picks_v10 = []
+    print("策略未通过门槛，已跳过")
 
 # === 策略2: BB1.00 ===
 print(f"\n=== BB1.00 ===")
-picks_b1, _ = run_strategy("BB1.00", 20, 1.00, 70, False, 300, market_ok_70)
-print(f"候选: {len(picks_b1)} 只")
-for p in picks_b1:
-    print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
+if STRATEGY_QUALIFIED.get('BB1.00', False):
+    picks_b1, _ = run_strategy("BB1.00", 20, 1.00, 70, False, 300, market_ok_70)
+    print(f"候选: {len(picks_b1)} 只")
+    for p in picks_b1:
+        print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
+else:
+    picks_b1 = []
+    print("策略未通过门槛，已跳过")
 
 # === 策略3: BB1.02 + KDJ Oversold ===
 print(f"\n=== BB1.02+KDJ（TOP500 7天）===")
-# KDJ过滤：在SQL里直接用 (kdj_k < 20 OR kdj_j < 0)
-cond_sql_kdj = f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * 1.02 AND (kdj_k < 20 OR kdj_j < 0)"
-top500_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:500]}
-placeholders = ','.join(f'"{s}"' for s in top500_syms)
-cond_sql_kdj += f" AND symbol IN ({placeholders})"
+if STRATEGY_QUALIFIED.get('BB1.02_KDJ', False):
+    # KDJ过滤：在SQL里直接用 (kdj_k < 20 OR kdj_j < 0)
+    cond_sql_kdj = f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * 1.02 AND (kdj_k < 20 OR kdj_j < 0)"
+    top500_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:500]}
+    placeholders = ','.join(f'\"{s}\"' for s in top500_syms)
+    cond_sql_kdj += f" AND symbol IN ({placeholders})"
 
-candidates_kdj = db.execute(f"""
-    SELECT symbol, close, rsi14, boll_lower, kdj_k, kdj_j FROM kline_daily
-    WHERE trade_date='{latest}' AND {cond_sql_kdj}
-    ORDER BY rsi14 ASC
-""").fetchall()
+    candidates_kdj = db.execute(f"""
+        SELECT symbol, close, rsi14, boll_lower, kdj_k, kdj_j FROM kline_daily
+        WHERE trade_date='{latest}' AND {cond_sql_kdj}
+        ORDER BY rsi14 ASC
+    """).fetchall()
 
-picks_kdj = []
-if market_ok_70:
-    for sym, close, rsi, bb, k, j in candidates_kdj:
-        picks_kdj.append((sym, close, rsi, bb, 0, fund.get(sym, 0)))
-picks_kdj.sort(key=lambda x: x[2])
-picks_kdj = picks_kdj[:20]
-print(f"候选: {len(picks_kdj)} 只")
-for p in picks_kdj:
-    print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
+    picks_kdj = []
+    if market_ok_70:
+        for sym, close, rsi, bb, k, j in candidates_kdj:
+            picks_kdj.append((sym, close, rsi, bb, 0, fund.get(sym, 0)))
+    picks_kdj.sort(key=lambda x: x[2])
+    picks_kdj = picks_kdj[:20]
+    print(f"候选: {len(picks_kdj)} 只")
+    for p in picks_kdj:
+        print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
+else:
+    picks_kdj = []
+    print("策略未通过门槛，已跳过")
 
 # === 历史记录 ===
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'reports', 'daily_picks')
 os.makedirs(HISTORY_DIR, exist_ok=True)
 result_record = {
     "date": latest,
+    "meta": {
+        "strategy_version": STRATEGY_VERSION,
+        "latest_trade_date": latest_trade,
+        "stale_trade_days": stale_trade_days or 0
+    },
     "strategies": {
         "Fstop3_pt5_v10": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_v10]},
         "BB1.00": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b1]},
@@ -345,26 +515,29 @@ elements = [
     {"tag": "hr"},
 ]
 
-# Fstop3 v10 - reference metrics from v4 framework eval
+# Fstop3 v10 - 动态读取评估结果
+fstop3_metric = STRATEGY_METRICS.get('Fstop3_pt5_v10', '⚠️ 回测指标待更新')
 elements += build_section(
     title="策略1️⃣ Fstop3_pt5（RSI<18 + BB触底 + 放量1.5x + 弱市50%）",
     picks=picks_v10,
-    cond_md="回测参考：三阶段胜率 58.6%/89.0%/68.4% | 夏普 2.92/2.32/3.90",
+    cond_md=f"回测参考：{fstop3_metric}",
     note_md="建议：T+1开盘买 | 止损3%止盈5% | 持有个≤10天了结",
     show_vol=True,
 )
-# BB1.00 - framework eval metrics
+# BB1.00 - 动态读取评估结果
+bb100_metric = STRATEGY_METRICS.get('BB1.00', '⚠️ 回测指标待更新')
 elements += build_section(
     title="策略2️⃣ BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
     picks=picks_b1,
-    cond_md="回测：三阶段胜率 57.7%/74.7%/69.2% | 夏普 1.43/3.76/3.26 | 测试52笔",
+    cond_md=f"回测：{bb100_metric}",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
 )
-# BB1.02+KDJ - framework eval metrics
+# BB1.02+KDJ - 动态读取评估结果
+bbkdj_metric = STRATEGY_METRICS.get('BB1.02_KDJ', '⚠️ 回测指标待更新')
 elements += build_section(
     title="策略3️⃣ BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
     picks=picks_kdj,
-    cond_md="回测：三阶段胜率 56.9%/67.0%/63.6% | 夏普 1.33/2.76/2.59 | 测试187笔",
+    cond_md=f"回测：{bbkdj_metric}",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
 )
 
@@ -382,6 +555,9 @@ GROUP_ID = os.environ.get("GROUP_ID_HOME", "oc_7670b1e26e01cfdc95f70ec74734e6af"
 def build_text_message():
     lines = []
     lines.append(f"📈 每日选股 {latest} | 三策略组合")
+    lines.append(f"策略版本：{STRATEGY_VERSION}")
+    if stale_trade_days and stale_trade_days > 0:
+        lines.append(f"⚠️ 数据滞后：最新交易日 {latest_trade}，当前使用 {latest}（滞后 {stale_trade_days} 个交易日）")
     lines.append(f"大盘弱市 {weak_pct:.1f}%（需50%:{'✅' if market_ok_50 else '❌'} | 需70%:{'✅' if market_ok_70 else '❌'}）")
     lines.append("")
 
@@ -402,20 +578,20 @@ def build_text_message():
     lines += format_picks(
         "策略1 Fstop3_pt5（RSI<18 + BB触底 + 放量1.5x + 弱市50%）",
         picks_v10,
-        "三阶段胜率 58.6%/89.0%/68.4% | 夏普 2.92/2.32/3.90",
+        STRATEGY_METRICS.get('Fstop3_pt5_v10', '⚠️ 回测指标待更新'),
         "T+1开盘买 | 止损3%止盈5% | 持有个≤10天了结",
         show_vol=True
     )
     lines += format_picks(
         "策略2 BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
         picks_b1,
-        "三阶段胜率 57.7%/74.7%/69.2% | 夏普 1.43/3.76/3.26 | 测试52笔",
+        STRATEGY_METRICS.get('BB1.00', '⚠️ 回测指标待更新'),
         "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
     )
     lines += format_picks(
         "策略3 BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
         picks_kdj,
-        "三阶段胜率 56.9%/67.0%/63.6% | 夏普 1.33/2.76/2.59 | 测试187笔",
+        STRATEGY_METRICS.get('BB1.02_KDJ', '⚠️ 回测指标待更新'),
         "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
     )
     lines.append(f"数据：{latest} | 三策略组合 | 不构成投资建议")
