@@ -33,8 +33,12 @@ import numpy as np
 # 添加项目根目录到 Python 路径
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> 项目根
 sys.path.insert(0, _project_root)
-# 也支持从 /mnt/data 路径调用
-sys.path.insert(0, '/mnt/data/workspace/stock-monitor-app-py')
+
+# 兼容旧路径（仅作为fallback，优先使用当前项目路径）
+_legacy_root = '/mnt/data/workspace/stock-monitor-app-py'
+if os.path.exists(_legacy_root):
+    sys.path.append(_legacy_root)
+
 from data_provider import DataFetcherManager
 from data_provider.tencent_fetcher import TencentFetcher
 from data_provider.akshare_fetcher import AkshareFetcher
@@ -62,8 +66,8 @@ try:
 except Exception:
     pass
 
-DB_PATH = '/mnt/data/workspace/stock-monitor-app-py/data/stock_data.db'
-LOG_DIR = '/mnt/data/workspace/stock-monitor-app-py/logs'
+DB_PATH = os.environ.get('STOCK_DB', os.path.join(_project_root, 'data', 'stock_data.db'))
+LOG_DIR = os.environ.get('SYNC_LOG_DIR', os.path.join(_project_root, 'logs'))
 INCR_DAYS = 15  # 增量更新天数
 
 os.makedirs(LOG_DIR, exist_ok=True)

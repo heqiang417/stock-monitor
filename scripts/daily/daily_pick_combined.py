@@ -22,13 +22,29 @@ DB_PATH = os.environ.get('STOCK_DB', '/home/heqiang/.openclaw/workspace/stock-mo
 READY_FLAG = '/tmp/stock_data_ready.flag'
 TODAY = datetime.now().strftime('%Y-%m-%d')
 MIN_STOCKS = 4000
+VALID_LOOKBACK_DAYS = 10
 
 db = sqlite3.connect(DB_PATH)
 db.execute('PRAGMA journal_mode=WAL')
 
+def get_latest_valid_trade_date(db, min_stocks=MIN_STOCKS, lookback_days=VALID_LOOKBACK_DAYS):
+    row = db.execute(
+        f"""
+        SELECT trade_date, COUNT(*) AS cnt
+        FROM kline_daily
+        WHERE trade_date >= date('{TODAY}', '-{lookback_days} day')
+        GROUP BY trade_date
+        HAVING cnt >= {min_stocks}
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return row[0] if row else None
+
+
 # === 确定日期 ===
 latest = args.date or TODAY
-if args.wait:
+if args.wait and not args.date:
     waited = 0
     while waited < 180:
         ready_date = None
@@ -37,19 +53,38 @@ if args.wait:
                 ready_date = f.read().strip()
         except FileNotFoundError:
             pass
-        if ready_date == latest or (waited >= 1 and ready_date):
+
+        if ready_date:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据就绪: {ready_date}")
+            latest = ready_date
             break
+
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 等待数据... ({waited}s)")
         time.sleep(60)
         waited += 1
     else:
-        print("等待超时，跳过")
-        db.close()
-        exit(1)
+        # wait超时时，自动回退到最近有效交易日
+        fallback = get_latest_valid_trade_date(db)
+        if fallback:
+            print(f"等待超时，回退到最近有效交易日: {fallback}")
+            latest = fallback
+        else:
+            print("等待超时且无有效交易日，跳过")
+            db.close()
+            exit(1)
+
     db.close()
     db = sqlite3.connect(DB_PATH)
     db.execute('PRAGMA journal_mode=WAL')
+
+# 若未指定日期且今天数据不足，自动回退到最近有效交易日
+if not args.date:
+    latest_total = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest,)).fetchone()[0]
+    if latest_total < MIN_STOCKS:
+        fallback = get_latest_valid_trade_date(db)
+        if fallback and fallback != latest:
+            print(f"当前日期数据不足({latest_total}只)，自动回退到: {fallback}")
+            latest = fallback
 
 # === 数据校验 ===
 def validate(db, date):
@@ -343,20 +378,65 @@ APP_SECRET = os.environ.get("APP_SECRET_BOT2", "ulvmnUvH1VBlqgPq298isdQ1VFURenaR
 OPEN_ID = os.environ.get("OPEN_ID_USER", "ou_8822a58f429ea317ab49166d79533b0f")  # 何强本人
 GROUP_ID = os.environ.get("GROUP_ID_HOME", "oc_7670b1e26e01cfdc95f70ec74734e6af")   # Home群
 
+# --- 构建纯文本消息 ---
+def build_text_message():
+    lines = []
+    lines.append(f"📈 每日选股 {latest} | 三策略组合")
+    lines.append(f"大盘弱市 {weak_pct:.1f}%（需50%:{'✅' if market_ok_50 else '❌'} | 需70%:{'✅' if market_ok_70 else '❌'}）")
+    lines.append("")
+
+    def format_picks(title, picks, cond, note, show_vol=False, max_show=5):
+        out = []
+        out.append(f"【{title}】共{len(picks)}只")
+        if picks:
+            for p in picks[:max_show]:
+                vol_str = f" 放量{p[4]:.1f}x" if (show_vol and p[4] > 0) else ""
+                out.append(f"  {stock_name(p[0])}({p[0][-6:]} 收{p[1]:.2f} RSI{p[2]:.1f}{vol_str})")
+        else:
+            out.append("  无候选")
+        out.append(f"  回测：{cond}")
+        out.append(f"  {note}")
+        out.append("")
+        return out
+
+    lines += format_picks(
+        "策略1 Fstop3_pt5（RSI<18 + BB触底 + 放量1.5x + 弱市50%）",
+        picks_v10,
+        "三阶段胜率 58.6%/89.0%/68.4% | 夏普 2.92/2.32/3.90",
+        "T+1开盘买 | 止损3%止盈5% | 持有个≤10天了结",
+        show_vol=True
+    )
+    lines += format_picks(
+        "策略2 BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
+        picks_b1,
+        "三阶段胜率 57.7%/74.7%/69.2% | 夏普 1.43/3.76/3.26 | 测试52笔",
+        "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
+    )
+    lines += format_picks(
+        "策略3 BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
+        picks_kdj,
+        "三阶段胜率 56.9%/67.0%/63.6% | 夏普 1.33/2.76/2.59 | 测试187笔",
+        "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
+    )
+    lines.append(f"数据：{latest} | 三策略组合 | 不构成投资建议")
+    return "\n".join(lines)
+
+text_msg = build_text_message()
+
 r = requests.post('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
     json={'app_id': APP_ID, 'app_secret': APP_SECRET})
 token = r.json().get('tenant_access_token')
 if not token:
     print("获取token失败"); db.close(); exit(1)
 
-# 私聊推送（默认）
+# 私聊推送（默认，文本格式）
 r2 = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
     params={'receive_id_type': 'open_id'},
     headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
     json={
         'receive_id': OPEN_ID,
-        'msg_type': 'interactive',
-        'content': json.dumps(card)
+        'msg_type': 'text',
+        'content': json.dumps({'text': text_msg})
     })
 resp = r2.json()
 if resp.get('code') == 0:
@@ -364,24 +444,20 @@ if resp.get('code') == 0:
 else:
     print(f"飞书私聊推送失败: {resp}")
 
-# 群里推送（仅 --also-group 时）
+# 群里推送（仅 --also-group 时，文本格式）
 if args.also_group:
     r3 = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
         params={'receive_id_type': 'chat_id'},
         headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
         json={
             'receive_id': GROUP_ID,
-            'msg_type': 'interactive',
-            'content': json.dumps(card)
+            'msg_type': 'text',
+            'content': json.dumps({'text': text_msg})
         })
     resp3 = r3.json()
     if resp3.get('code') == 0:
         print(f"飞书群推送成功")
     else:
         print(f"飞书群推送失败: {resp3}")
-
-with open("/tmp/daily-pick-combined-card.json","w") as f:
-    json.dump(card, f, ensure_ascii=False)
-print(f"卡片已保存: /tmp/daily-pick-combined-card.json")
 
 db.close()

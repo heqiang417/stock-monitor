@@ -48,6 +48,8 @@ args = parser.parse_args()
 
 INCR_DAYS = 60 if args.full else args.days
 TODAY = datetime.now().strftime('%Y-%m-%d')
+MIN_STOCKS = 4000
+VALID_LOOKBACK_DAYS = 10
 beg_date = (datetime.now() - timedelta(days=INCR_DAYS + 10)).strftime('%Y-%m-%d')
 end_date = TODAY
 
@@ -457,14 +459,18 @@ def main():
         # 7. 增量算今天布林带（必须在 READY_FLAG 之前完成）
         _calc_today_bollinger()
 
-        # 最终校验（布林带算完后才发就绪信号，供 daily_pick 监听）
-        post_sync_validate()
-        try:
-            with open(READY_FLAG, 'w') as f:
-                f.write(TODAY)
-            log(f"  🏁 就绪信号已写入: {READY_FLAG} ({TODAY})")
-        except Exception as e:
-            log(f"  ⚠️ 写入就绪信号失败: {e}")
+        # 最终校验（布林带算完后再决定是否发就绪信号）
+        ok, valid_date = post_sync_validate()
+        if ok:
+            try:
+                with open(READY_FLAG, 'w') as f:
+                    # 写“最近有效交易日”，而不是强制TODAY
+                    f.write(valid_date)
+                log(f"  🏁 就绪信号已写入: {READY_FLAG} ({valid_date})")
+            except Exception as e:
+                log(f"  ⚠️ 写入就绪信号失败: {e}")
+        else:
+            log("  ⏸️ 本次同步未通过校验，不写就绪信号")
 
     elapsed = time.time() - start_time
     log(f"同步完成! 耗时: {elapsed:.1f}秒 ({elapsed/60:.1f}分钟)")
@@ -536,60 +542,93 @@ def _calc_today_bollinger():
 # ============================================================
 # 同步后数据校验
 # ============================================================
+def get_latest_valid_trade_date(conn, min_stocks=MIN_STOCKS, lookback_days=VALID_LOOKBACK_DAYS):
+    """返回最近一个“有效交易日”（K线>=min_stocks），找不到返回None"""
+    row = conn.execute(
+        f"""
+        SELECT trade_date, COUNT(*) AS cnt
+        FROM kline_daily
+        WHERE trade_date >= date('{TODAY}', '-{lookback_days} day')
+        GROUP BY trade_date
+        HAVING cnt >= {min_stocks}
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return row[0] if row else None
+
+
 def post_sync_validate():
-    """同步完成后校验数据完整性，发现异常立即告警"""
+    """同步完成后校验数据完整性，发现异常立即告警。返回(True/False, valid_date)"""
     log("=== 同步后数据校验 ===")
     conn = sqlite3.connect(DB_PATH)
-    today = TODAY
-    errors = []
-    stats = {}
+    target_date = get_latest_valid_trade_date(conn)
 
-    # 1. 今日K线数量
-    total = conn.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{today}'").fetchone()[0]
-    stats['kline'] = total
-    if total < 4000:
-        errors.append(f"K线数据不足: {total}只（需≥4000）")
+    if not target_date:
+        conn.close()
+        msg = f"最近{VALID_LOOKBACK_DAYS}天无有效交易日（K线<={MIN_STOCKS}）"
+        log(f"  ❌ 校验失败: {msg}")
+        with open('/tmp/stock_sync_alert.txt', 'w') as f:
+            f.write(f"{TODAY} sync failed:\n{msg}\n")
+        return False, None
+
+    errors = []
+
+    # 1. 目标日K线数量
+    total = conn.execute(
+        "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?",
+        (target_date,)
+    ).fetchone()[0]
+    if total < MIN_STOCKS:
+        errors.append(f"K线数据不足: {target_date} {total}只（需≥{MIN_STOCKS}）")
 
     # 2. 技术指标覆盖率
-    has_rsi = conn.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{today}' AND rsi14 IS NOT NULL").fetchone()[0]
-    has_ma = conn.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{today}' AND ma20 IS NOT NULL").fetchone()[0]
-    stats['rsi'] = has_rsi
-    stats['ma20'] = has_ma
+    has_rsi = conn.execute(
+        "SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND rsi14 IS NOT NULL",
+        (target_date,)
+    ).fetchone()[0]
+    has_ma = conn.execute(
+        "SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND ma20 IS NOT NULL",
+        (target_date,)
+    ).fetchone()[0]
     if total > 0 and has_rsi < total * 0.8:
-        errors.append(f"RSI未覆盖: {has_rsi}/{total}只")
+        errors.append(f"RSI未覆盖: {target_date} {has_rsi}/{total}只")
     if total > 0 and has_ma < total * 0.8:
-        errors.append(f"MA20未覆盖: {has_ma}/{total}只")
+        errors.append(f"MA20未覆盖: {target_date} {has_ma}/{total}只")
 
-    # 3. 估值数据
-    val = conn.execute(f"SELECT COUNT(*) FROM daily_valuation WHERE trade_date='{today}'").fetchone()[0]
-    stats['valuation'] = val
-
-    # 4. 上一交易日对比（检测数据量骤降）
-    prev_date = conn.execute(f"SELECT MAX(trade_date) FROM kline_daily WHERE trade_date<'{today}'").fetchone()[0]
-    if prev_date:
-        prev_total = conn.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{prev_date}'").fetchone()[0]
-        stats['prev'] = prev_total
-        if total > 0 and prev_total > 0 and total < prev_total * 0.9:
-            errors.append(f"数据量骤降: 今日{total}只 vs 上日{prev_total}只")
+    # 3. 上一有效交易日对比（检测数据量骤降）
+    prev = conn.execute(
+        """
+        SELECT trade_date, COUNT(*) AS cnt
+        FROM kline_daily
+        WHERE trade_date < ?
+        GROUP BY trade_date
+        HAVING cnt >= ?
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """,
+        (target_date, MIN_STOCKS)
+    ).fetchone()
+    if prev and total < prev[1] * 0.9:
+        errors.append(f"数据量骤降: {target_date} {total}只 vs 上日{prev[0]} {prev[1]}只")
 
     conn.close()
 
-    # 输出结果
-    summary = f"K线{total}只, RSI{has_rsi}只, MA20{has_ma}只, 估值{val}只"
+    summary = f"目标日{target_date}: K线{total}只, RSI{has_rsi}只, MA20{has_ma}只"
     if errors:
         log(f"  ❌ 校验失败: {summary}")
         for e in errors:
             log(f"    • {e}")
-        # 写告警到文件，供后续检查
         with open('/tmp/stock_sync_alert.txt', 'w') as f:
             f.write(f"{TODAY} sync failed:\n" + '\n'.join(errors))
+        return False, target_date
     else:
         log(f"  ✅ 校验通过: {summary}")
-        # 清除旧告警
         try:
             os.remove('/tmp/stock_sync_alert.txt')
         except:
             pass
+        return True, target_date
 
 
 if __name__ == '__main__':
