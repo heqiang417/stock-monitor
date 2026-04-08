@@ -45,10 +45,10 @@
   → 若当天数据不足，自动回退到最近有效交易日
   → 读取 db 最新有效交易日数据
   → 执行组合策略筛选：
-      1. Fstop3_pt5 v10（RSI<18 + BB触底 + 放量1.5x + 弱市50%）
-      2. BB1.00（RSI<20 + BB≤1.00 + 弱市70%）
-      3. BB0.99（RSI<20 + BB≤0.99 + 弱市70%）
+      1. BB1.00（RSI<20 + BB≤1.00 + 弱市70%）
+      2. BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）
   → 飞书**文本消息**推送（私聊发给何强本人）
+  → Fstop3_pt5 作为历史/对照策略，不再参与正式推送
 ```
 
 ---
@@ -57,9 +57,10 @@
 
 | 策略 | 脚本 | 触发时间 | 持有规则 | 手册 |
 |------|------|---------|---------|------|
-| **Fstop3_pt5 v10** | daily_pick_combined.py | 工作日 20:30 | 止损3% + 止盈5% | [手册](../strategy/Fstop3_pt5_v10/README.md) |
-| BB1.00 | daily_pick_combined.py | 工作日 20:30 | 固定7天 | [手册](../strategy/BB1.00/README.md) |
-| BB0.99 | daily_pick_combined.py | 工作日 20:30 | 固定7天 | [手册](../strategy/BB0.99/README.md) |
+| **BB1.00** | daily_pick_combined.py | 工作日 20:30 | 固定7天 | [手册](../strategy/BB1.00/README.md) |
+| **BB1.02+KDJ** | daily_pick_combined.py | 工作日 20:30 | 固定7天 | [手册](../strategy/BB1.00/README.md)（BB1.00手册代） |
+
+> 注：Fstop3_pt5 v10 已降级为历史/对照策略，不再属于正式每日策略池。
 
 ---
 

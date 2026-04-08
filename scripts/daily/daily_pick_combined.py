@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-每日选股 - 策略组合包
-包含三个策略：
-  1. Fstop3_pt5 v10：RSI<18 + BB触底 + 放量1.5x + 弱市50%
-  2. BB1.00：RSI<20 + BB<=1.00 + 弱市70% + 7天持有
-  3. BB1.02+KDJ Oversold：RSI<20 + BB<=1.02 + KDJ超卖 + 弱市70% + TOP500
+每日选股 - 正式策略组合包
+
+正式策略（均满足三阶段正率>55%，测试样本>=30）：
+  1. BB1.00：RSI<20 + BB<=1.00 + 弱市70% + 7天持有
+  2. BB1.02+KDJ Oversold：RSI<20 + BB<=1.02 + KDJ超卖 + 弱市70% + TOP500
+
+Fstop3_pt5 v10：已降级为历史/对照策略，不再纳入正式每日策略池。
+
 用法: python3 daily_pick_combined.py [--date 2026-04-02] [--push]
 """
 import sqlite3, json, subprocess, os, argparse, time, requests
@@ -392,18 +395,17 @@ def run_strategy(name, rsi_thresh, bb_mult, weak_thresh, vol_required, topn, mar
     picks.sort(key=lambda x: x[2])
     return picks[:20], market_ok
 
-# === 策略1: Fstop3_pt5 v10 ===
-print(f"\n=== Fstop3_pt5 v10 ===")
+# === 历史/对照策略：Fstop3_pt5 v10（不再纳入正式策略池）===
+# Fstop3 仍计算结果，但不参与正式推送
+print(f"\n=== Fstop3_pt5 v10（历史/对照，不纳入正式池）===")
 if STRATEGY_QUALIFIED.get('Fstop3_pt5_v10', False):
     picks_v10, _ = run_strategy("Fstop3_pt5", 18, 1.0, 50, True, 0, market_ok_50)
-    print(f"候选: {len(picks_v10)} 只")
-    for p in picks_v10:
-        print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f} vol_ratio={p[4]:.2f}x")
+    print(f"  (合格但已降级为历史/对照策略，不参与正式推送) 候选: {len(picks_v10)} 只")
 else:
     picks_v10 = []
-    print("策略未通过门槛，已跳过")
+    print("  不合格，已从正式策略池移除")
 
-# === 策略2: BB1.00 ===
+# === 正式策略1: BB1.00 ===
 print(f"\n=== BB1.00 ===")
 if STRATEGY_QUALIFIED.get('BB1.00', False):
     picks_b1, _ = run_strategy("BB1.00", 20, 1.00, 70, False, 300, market_ok_70)
@@ -414,7 +416,7 @@ else:
     picks_b1 = []
     print("策略未通过门槛，已跳过")
 
-# === 策略3: BB1.02 + KDJ Oversold ===
+# === 正式策略2: BB1.02 + KDJ Oversold ===
 print(f"\n=== BB1.02+KDJ（TOP500 7天）===")
 if STRATEGY_QUALIFIED.get('BB1.02_KDJ', False):
     # KDJ过滤：在SQL里直接用 (kdj_k < 20 OR kdj_j < 0)
@@ -453,9 +455,16 @@ result_record = {
         "stale_trade_days": stale_trade_days or 0
     },
     "strategies": {
-        "Fstop3_pt5_v10": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_v10]},
         "BB1.00": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b1]},
         "BB1.02_KDJ": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_kdj]},
+    },
+    "reference_strategies": {
+        "Fstop3_pt5_v10": {
+            "status": "historical_reference",
+            "qualified": bool(STRATEGY_QUALIFIED.get('Fstop3_pt5_v10', False)),
+            "metrics": STRATEGY_METRICS.get('Fstop3_pt5_v10', ''),
+            "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_v10],
+        }
     },
     "market": {"weak_pct": round(weak_pct, 1), "market_ok_50": market_ok_50, "market_ok_70": market_ok_70}
 }
@@ -509,7 +518,7 @@ def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False):
     ]
 
 elements = [
-    {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 三策略组合**"}},
+    {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 正式策略池**"}},
     {"tag": "hr"},
     {"tag": "div", "text": {"tag": "lark_md", "content": f"🟢 大盘弱市 {weak_pct:.1f}%（需50%:{'✅' if market_ok_50 else '❌'} | 需70%:{'✅' if market_ok_70 else '❌'}）"}},
     {"tag": "hr"},
@@ -527,7 +536,7 @@ elements += build_section(
 # BB1.00 - 动态读取评估结果
 bb100_metric = STRATEGY_METRICS.get('BB1.00', '⚠️ 回测指标待更新')
 elements += build_section(
-    title="策略2️⃣ BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
+    title="正式策略1️⃣ BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
     picks=picks_b1,
     cond_md=f"回测：{bb100_metric}",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
@@ -535,7 +544,7 @@ elements += build_section(
 # BB1.02+KDJ - 动态读取评估结果
 bbkdj_metric = STRATEGY_METRICS.get('BB1.02_KDJ', '⚠️ 回测指标待更新')
 elements += build_section(
-    title="策略3️⃣ BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
+    title="正式策略2️⃣ BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
     picks=picks_kdj,
     cond_md=f"回测：{bbkdj_metric}",
     note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
@@ -554,7 +563,7 @@ GROUP_ID = os.environ.get("GROUP_ID_HOME", "oc_7670b1e26e01cfdc95f70ec74734e6af"
 # --- 构建纯文本消息 ---
 def build_text_message():
     lines = []
-    lines.append(f"📈 每日选股 {latest} | 三策略组合")
+    lines.append(f"📈 每日选股 {latest} | 正式策略池")
     lines.append(f"策略版本：{STRATEGY_VERSION}")
     if stale_trade_days and stale_trade_days > 0:
         lines.append(f"⚠️ 数据滞后：最新交易日 {latest_trade}，当前使用 {latest}（滞后 {stale_trade_days} 个交易日）")
@@ -576,25 +585,19 @@ def build_text_message():
         return out
 
     lines += format_picks(
-        "策略1 Fstop3_pt5（RSI<18 + BB触底 + 放量1.5x + 弱市50%）",
-        picks_v10,
-        STRATEGY_METRICS.get('Fstop3_pt5_v10', '⚠️ 回测指标待更新'),
-        "T+1开盘买 | 止损3%止盈5% | 持有个≤10天了结",
-        show_vol=True
-    )
-    lines += format_picks(
-        "策略2 BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
+        "正式策略1 BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
         picks_b1,
         STRATEGY_METRICS.get('BB1.00', '⚠️ 回测指标待更新'),
         "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
     )
     lines += format_picks(
-        "策略3 BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
+        "正式策略2 BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
         picks_kdj,
         STRATEGY_METRICS.get('BB1.02_KDJ', '⚠️ 回测指标待更新'),
         "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
     )
-    lines.append(f"数据：{latest} | 三策略组合 | 不构成投资建议")
+    lines.append("注：Fstop3_pt5 已降级为历史/对照策略，不参与正式每日推送")
+    lines.append(f"数据：{latest} | 正式策略2只 | 不构成投资建议")
     return "\n".join(lines)
 
 text_msg = build_text_message()
