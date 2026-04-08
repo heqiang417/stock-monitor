@@ -68,8 +68,16 @@ data/**/*_summary.json
 backfill_*.txt
 data/failed_*.txt
 
-# 每日推送记录
+# 每日推送记录（运行产物，不纳入版本控制）
 reports/daily_picks/*.json
+scripts/reports/daily_picks/*.json
+
+# 探索结果（运行产物，不纳入版本控制）
+data/results/explore_direction_*.json
+results/strategy_explorer_report.md
+
+# 大量历史回测报告：默认不自动纳入版本控制，正式报告再手动挑选
+# docs/backtesting/reports/*.md
 
 # Dev scripts (keep only essential ones)
 adx_*.py

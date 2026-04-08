@@ -20,7 +20,29 @@
 
 | # | 策略名 | 信号条件 | 持有规则 | 弱市 | 基本面 | 评估日期 | 状态 |
 |---|--------|---------|---------|------|--------|---------|------|
-| 1 | **Fstop3_pt5 v10** | RSI<18 + BB触底 + 放量1.5x | 止损3%/止盈5% | ≥50% | TOP300 | 2026-04-02 | 🟢 实盘 |
+| 1 | **Fstop3_pt5 v10** | RSI<18 + BB触底 + 放量1.5x | 止损3%/止盈5% | ≥50% | TOP300 | 2026-04-07 | 🟢 运行中（口径已统一） |
+| 2 | **BB1.00** | RSI<20 + BB≤1.00 | 固定7天 | ≥70% | TOP300 | 2026-04-07 | 🟢 运行中 |
+| 3 | **BB0.99** | RSI<20 + BB≤0.99 | 固定7天 | ≥70% | TOP300 | 2026-04-07 | 🟢 运行中 |
+
+---
+
+## 当前搜索状态（2026-04-08）
+
+### 已确认结论
+- 三方向搜索（strict market filter / capital flow filter / dynamic position sizing）已完成收口。
+- **结论：本轮无可直接上线候选。**
+- 主要原因不是收益率先不够，而是**测试集样本远不足 30**：
+  - direction1 `strict_market_filter`：train 100 / val 81 / test 1
+  - direction2 `capital_flow_filter`：train 116 / val 86 / test 3
+  - direction3 `dynamic_position_sizing`：train 83 / val 81 / test 1
+
+### 下一轮方向
+- 搜索目标已从“继续增强过滤”调整为：
+  1. **样本优先**：train / val / test 都要 >= 30
+  2. **三阶段正率优先**：三阶段都 > 55%
+  3. **稳定性优先**：优先三阶段 spread 小的方案，最后才看 test Sharpe
+- 已新增脚本：`scripts/exploration/explore_direction_6_sample_first.py`
+- 当前方向：**宽入口 + 轻过滤 + 稳定性排序**
 
 ---
 
@@ -28,12 +50,14 @@
 
 按测试期胜率排序：
 
-| # | 策略名 | 训练 | 验证 | 测试 | 测试笔数 | 测试夏普 | 弱市类型 | 来源 | 备注 |
-|---|--------|------|------|------|----------|----------|---------|------|------|
-| 1 | BB1.02 + KDJ Oversold + RSI<20 + TOP500 + 10天 | 55.0% | 68.3% | **71.3%** | 167 | 2.67 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) | 测试期胜率最高 |
-| 2 | BB1.02 + KDJ Oversold + RSI<20 + TOP300 + 7天 | 56.2% | 64.9% | **63.6%** | 110 | 2.77 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) | TOP300，稳健 |
-| 3 | BB1.02 + KDJ Oversold + RSI<20 + TOP500 + 7天 | 56.9% | 67.0% | **63.6%** | 187 | 2.59 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) | 样本最大 |
-| 4 | BB1.02 + KDJ Oversold + RSI<20 + TOP200 + 7天 | 56.2% | 66.3% | **60.0%** | 70 | 2.62 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) | TOP200，防御型 |
+| # | 策略名 | 训练 | 验证 | 测试 | 测试笔数 | 测试夏普 | 弱市类型 | 手册 |
+|---|--------|------|------|------|----------|----------|---------|------|
+| 1 | **BB1.00** RSI<20 + BB≤1.00 + 弱市70% + TOP300 + 7天 | 57.7% | 74.7% | **69.2%** | 52 | 3.26 | width70 | [手册](BB1.00/README.md) |
+| 2 | BB1.02 + KDJ Oversold + RSI<20 + TOP500 + 10天 | 55.0% | 68.3% | **71.3%** | 167 | 2.67 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) |
+| 3 | BB1.02 + KDJ Oversold + RSI<20 + TOP300 + 7天 | 56.2% | 64.9% | **63.6%** | 110 | 2.77 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) |
+| 4 | BB1.02 + KDJ Oversold + RSI<20 + TOP500 + 7天 | 56.9% | 67.0% | **63.6%** | 187 | 2.59 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) |
+| 5 | **BB0.99** RSI<20 + BB≤0.99 + 弱市70% + TOP300 + 7天 | 61.1% | 81.4% | **64.5%** | 31 | 2.67 | width70 | [手册](BB0.99/README.md) |
+| 6 | BB1.02 + KDJ Oversold + RSI<20 + TOP200 + 7天 | 56.2% | 66.3% | **60.0%** | 70 | 2.62 | width70 | [报告](../backtesting/reports/bb_kdj_rsi_weak_report.md) |
 
 ---
 
@@ -78,11 +102,13 @@
 
 ## 相关文档
 
-- [Fstop3_pt5 v10 策略手册](Fstop3_pt5_v10.md)
+- [Fstop3_pt5 v10 策略手册](Fstop3_pt5_v10/README.md)
 - [Fstop3_pt5 v10 回测报告](../backtesting/reports/Fstop3_pt5_v10.md)
+- [BB1.00 策略手册](BB1.00/README.md)
+- [BB1.00 回测报告](BB1.00/backtest_report.md)
+- [BB0.99 策略手册](BB0.99/README.md)
+- [BB0.99 回测报告](BB0.99/backtest_report.md)
 - [EVAL_FRAMEWORK.md](../EVAL_FRAMEWORK.md)
-- [评估框架说明](../../EVAL_FRAMEWORK.md)
-- [scripts/bb_kdj_rsi_weak_explore.py](../../scripts/bb_kdj_rsi_weak_explore.py)
 
 ---
 
@@ -90,4 +116,7 @@
 
 | 日期 | 动作 |
 |------|------|
+| 2026-04-08 | 补充当前搜索状态：三方向搜索无上线候选，下一轮改为样本优先搜索 |
+| 2026-04-07 | Fstop3 评估 / 报告 / daily_push 指标口径统一 |
 | 2026-04-03 | 首次创建，纳入 Fstop3_pt5_v10 + 4个候选策略 |
+| 2026-04-03 | 新增 BB1.00 + BB0.99 策略手册和回测报告，纳入候选列表 |

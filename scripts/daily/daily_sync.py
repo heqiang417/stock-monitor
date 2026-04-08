@@ -30,13 +30,28 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
-# 添加项目根目录到 Python 路径
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # scripts/ -> 项目根
+# 添加项目根目录到 Python 路径（稳健解析：scripts/daily -> 项目根）
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_candidate_roots = [
+    os.path.dirname(os.path.dirname(_script_dir)),  # .../stock-monitor-app-py（标准）
+    os.path.dirname(_script_dir),                   # .../scripts（兜底）
+]
+
+_project_root = None
+for p in _candidate_roots:
+    if os.path.isdir(os.path.join(p, 'data_provider')):
+        _project_root = p
+        break
+
+if _project_root is None:
+    # 最后兜底：保持旧行为，避免直接崩溃
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 sys.path.insert(0, _project_root)
 
 # 兼容旧路径（仅作为fallback，优先使用当前项目路径）
 _legacy_root = '/mnt/data/workspace/stock-monitor-app-py'
-if os.path.exists(_legacy_root):
+if os.path.exists(_legacy_root) and _legacy_root != _project_root:
     sys.path.append(_legacy_root)
 
 from data_provider import DataFetcherManager
@@ -69,11 +84,21 @@ except Exception:
 DB_PATH = os.environ.get('STOCK_DB', os.path.join(_project_root, 'data', 'stock_data.db'))
 LOG_DIR = os.environ.get('SYNC_LOG_DIR', os.path.join(_project_root, 'logs'))
 INCR_DAYS = 15  # 增量更新天数
+DB_TIMEOUT = int(os.environ.get('STOCK_DB_TIMEOUT', '60'))
+DB_BUSY_TIMEOUT_MS = int(os.environ.get('STOCK_DB_BUSY_TIMEOUT_MS', '60000'))
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
 today = datetime.now().strftime('%Y-%m-%d')
 log_file = os.path.join(LOG_DIR, f'sync_{today}.log')
+
+
+def connect_db():
+    db_dir = os.path.dirname(DB_PATH) or '.'
+    os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
+    conn.execute(f'PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}')
+    return conn
 
 def log(msg):
     ts = datetime.now().strftime('%H:%M:%S')
@@ -84,13 +109,15 @@ def log(msg):
 
 # 记录已注册的数据源
 log(f"已注册数据源: {[f.name for f in _manager.fetchers]}")
+log(f"数据库路径: {DB_PATH}")
+log(f"数据库目录存在: {os.path.isdir(os.path.dirname(DB_PATH) or '.')} | 文件存在: {os.path.exists(DB_PATH)} | timeout={DB_TIMEOUT}s | busy_timeout={DB_BUSY_TIMEOUT_MS}ms")
 
 # ============================================================
 # 1. 日K线增量更新（多数据源自动切换）
 # ============================================================
 def sync_daily_kline():
     log("=== 开始同步日K线（多数据源）===")
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
     conn.close()
 
@@ -105,7 +132,7 @@ def sync_daily_kline():
             if df is None or df.empty:
                 return 0
 
-            conn2 = sqlite3.connect(DB_PATH)
+            conn2 = connect_db()
             count = 0
             for _, row in df.iterrows():
                 try:
@@ -146,7 +173,7 @@ def sync_daily_kline():
 # ============================================================
 def recalc_technical_indicators():
     log("=== 重算技术指标 ===")
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
     updated = 0
 
@@ -211,7 +238,7 @@ def sync_financial_indicators():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     all_symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
 
     # 找出最久没更新的500只
@@ -239,7 +266,7 @@ def sync_financial_indicators():
                 failed += 1
                 continue
             latest = df.iloc[0]
-            conn2 = sqlite3.connect(DB_PATH)
+            conn2 = connect_db()
             conn2.execute('''INSERT OR REPLACE INTO financial_indicators
                 (symbol, report_date, eps, roe, revenue_growth, profit_growth,
                  gross_margin, net_margin, debt_ratio, current_ratio, total_assets)
@@ -272,7 +299,7 @@ def build_financial_daily():
     """把每只股票最新的财务数据写入 financial_daily，保证每天有完整快照"""
     log("=== 构建财务每日快照 ===")
     today = datetime.now().strftime('%Y-%m-%d')
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
 
     # 建表
     conn.execute('''CREATE TABLE IF NOT EXISTS financial_daily (
@@ -312,7 +339,7 @@ def build_financial_daily():
 def sync_weekly_kline():
     log("=== 同步周K线（多数据源自动切换）===")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
 
     start_date = (datetime.now() - timedelta(days=60)).strftime('%Y%m%d')
@@ -350,7 +377,7 @@ def sync_weekly_kline():
 def sync_monthly_kline():
     log("=== 同步月K线（多数据源自动切换）===")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
 
     start_date = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
@@ -393,7 +420,7 @@ def sync_valuation():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     try:
         df = ak.stock_zh_a_spot_em()
         if df is not None and not df.empty:
@@ -437,7 +464,7 @@ def sync_capital_flow():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
     conn.close()
 
@@ -472,7 +499,7 @@ def sync_capital_flow():
     def write_batch(rows):
         if not rows:
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA synchronous=NORMAL')
         conn.executemany('''INSERT OR REPLACE INTO capital_flow
@@ -518,7 +545,7 @@ def sync_industry():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
 
     # 尝试批量获取
@@ -582,7 +609,7 @@ def sync_northbound_flow():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     # 检查已有最新日期
     latest = conn.execute("SELECT MAX(date) FROM northbound_flow").fetchone()[0]
     conn.close()
@@ -597,7 +624,7 @@ def sync_northbound_flow():
                 '日期': 'date', '当日资金流入': 'net_buy',
                 '当日余额': 'balance', '历史累计净买额': 'net_flow'
             })
-            conn2 = sqlite3.connect(DB_PATH)
+            conn2 = connect_db()
             for _, row in df.iterrows():
                 d = str(row.get('date', ''))
                 if latest and d <= latest:
@@ -627,7 +654,7 @@ def sync_margin_data():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     latest = conn.execute("SELECT MAX(date) FROM margin_data").fetchone()[0]
     conn.close()
 
@@ -666,7 +693,7 @@ def sync_margin_data():
                 short_amount += float(row.get('融券卖出额', 0) or 0)
                 short_volume += float(row.get('融券余量', 0) or 0)
 
-            conn2 = sqlite3.connect(DB_PATH)
+            conn2 = connect_db()
             conn2.execute('''INSERT OR IGNORE INTO margin_data
                 (date, margin_balance, margin_buy, short_volume, short_amount,
                  short_sell, total_balance) VALUES (?,?,?,?,?,?,?)''',
@@ -692,7 +719,7 @@ def sync_shareholder_data():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     # 找出最久没更新的500只
     stale = conn.execute('''
         SELECT k.symbol FROM kline_daily k
@@ -715,7 +742,7 @@ def sync_shareholder_data():
         try:
             df = ak.stock_circulate_stock_holder(symbol=code)
             if df is not None and not df.empty:
-                conn2 = sqlite3.connect(DB_PATH)
+                conn2 = connect_db()
                 for _, row in df.iterrows():
                     rd = str(row.get('日期', ''))
                     name = str(row.get('股东名称', ''))
@@ -748,7 +775,7 @@ def sync_limit_up_down():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     latest = conn.execute("SELECT MAX(date) FROM limit_up_down").fetchone()[0]
     conn.close()
 
@@ -773,7 +800,7 @@ def sync_limit_up_down():
         try:
             df = ak.stock_zt_pool_em(date=date_str)
             if df is not None and not df.empty:
-                conn2 = sqlite3.connect(DB_PATH)
+                conn2 = connect_db()
                 for _, row in df.iterrows():
                     code = str(row.get('代码', ''))
                     conn2.execute('''INSERT OR IGNORE INTO limit_up_down
@@ -803,7 +830,7 @@ def sync_limit_up_down():
         try:
             df = ak.stock_zt_pool_dtgc_em(date=date_str)
             if df is not None and not df.empty:
-                conn2 = sqlite3.connect(DB_PATH)
+                conn2 = connect_db()
                 for _, row in df.iterrows():
                     code = str(row.get('代码', ''))
                     conn2.execute('''INSERT OR IGNORE INTO limit_up_down
@@ -846,7 +873,7 @@ def sync_news():
         log("  TAVILY_API_KEY 未设置，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     # 建表
     conn.execute('''CREATE TABLE IF NOT EXISTS news_daily (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -893,7 +920,7 @@ def sync_news():
             if not results:
                 continue
 
-            conn2 = sqlite3.connect(DB_PATH)
+            conn2 = connect_db()
             for item in results:
                 title = item.get("title", "")
                 url = item.get("url", "")
@@ -943,7 +970,7 @@ def sync_market_review():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     conn.execute('''CREATE TABLE IF NOT EXISTS market_review (
         trade_date TEXT PRIMARY KEY,
         index_data TEXT,
@@ -1119,7 +1146,7 @@ def sync_chip_distribution():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     conn.execute('''CREATE TABLE IF NOT EXISTS chip_distribution (
         symbol TEXT NOT NULL,
         trade_date TEXT NOT NULL,
@@ -1171,7 +1198,7 @@ def sync_chip_distribution():
                 conc_90 = float(last.get('90集中度', last.get('concentration_90', 0)) or 0)
                 conc_70 = float(last.get('70集中度', last.get('concentration_70', 0)) or 0)
 
-            conn2 = sqlite3.connect(DB_PATH)
+            conn2 = connect_db()
             conn2.execute('''INSERT OR REPLACE INTO chip_distribution
                 (symbol, trade_date, chip_data, avg_cost, profit_ratio,
                  concentration_90, concentration_70)
@@ -1208,7 +1235,7 @@ def sync_index_kline():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     total = 0
 
     for symbol, name in INDEX_SYMBOLS.items():
@@ -1313,7 +1340,7 @@ def sync_lhb():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     latest = conn.execute("SELECT MAX(trade_date) FROM lhb_detail").fetchone()[0]
     conn.close()
 
@@ -1341,7 +1368,7 @@ def sync_lhb():
             log("  无龙虎榜数据")
             return
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         for _, row in df.iterrows():
             trade_date = str(row.get('上榜日', ''))[:10]
             if latest and trade_date <= latest:
@@ -1389,7 +1416,7 @@ def sync_block_trades():
         log("  akshare 未安装，跳过")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     latest = conn.execute("SELECT MAX(trade_date) FROM block_trades").fetchone()[0]
     conn.close()
 
@@ -1410,7 +1437,7 @@ def sync_block_trades():
             log("  无大宗交易数据")
             return
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         for _, row in df.iterrows():
             trade_date = str(row.get('交易日期', ''))[:10]
             try:
@@ -1546,7 +1573,7 @@ def main():
 def validate_and_report(elapsed):
     """同步后校验数据完整性，异常发飞书告警"""
     log("=== 数据完整性校验 ===")
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     today = datetime.now().strftime('%Y-%m-%d')
     errors = []
     warnings = []
