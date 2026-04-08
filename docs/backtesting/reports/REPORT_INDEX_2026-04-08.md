@@ -20,6 +20,8 @@
 | `strategy_search_v5_evaluate.md` | v5 的完整评估版，比纯搜索报告更有保留价值 |
 | `README.md` | 当前目录索引说明 |
 
+> 注：`full_pool_*` 系列已于 2026-04-08 归档到 `docs/backtesting/archive/`，不再作为当前主线报告保留在 `reports/` 根目录。
+
 ---
 
 ## B. 历史归档（建议保留，但视为旧阶段结果）
@@ -47,6 +49,10 @@
 | `backtest_full_summary.md` | 全量策略回测汇总 |
 | `backtest_summary.md` | 经典策略回测总结 |
 | `train_val_summary.md` | 与 train_val_backtest_report 主题接近，建议后续二选一 |
+| `full_pool_strategy_report.md` | 全股票池策略历史初版 |
+| `full_pool_v2_report.md` | 全股票池策略历史 v2 |
+| `full_pool_short_hold_report.md` | 全股票池短周期历史扩展版 |
+| `optimize_report.md` | short_reversal 历史优化报告 |
 
 ---
 
@@ -66,14 +72,7 @@
 
 ## D. 当前未纳入版本控制但建议手工判断的文件
 
-以下文件当前是未跟踪状态，先不要直接提交，也不要急着删：
-
-| 文件 | 建议 |
-|------|------|
-| `full_pool_short_hold_report.md` | 先归档判断 |
-| `full_pool_strategy_report.md` | 先归档判断 |
-| `full_pool_v2_report.md` | 先归档判断 |
-| `optimize_report.md` | 若 short_reversal 已脱离主线，可移到历史归档区 |
+目前这一类已经基本清空。`full_pool_*` 与 `optimize_report.md` 已转入 `docs/backtesting/archive/`。
 
 ---
 
