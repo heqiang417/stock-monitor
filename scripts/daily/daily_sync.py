@@ -658,7 +658,7 @@ def sync_margin_data():
     latest = conn.execute("SELECT MAX(date) FROM margin_data").fetchone()[0]
     conn.close()
 
-    # 最近5个交易日的日期
+    # 最近7个自然日内取交易日候选
     dates_to_fetch = []
     d = datetime.now()
     while len(dates_to_fetch) < 7:
@@ -674,45 +674,59 @@ def sync_margin_data():
         return
 
     count = 0
+    failed = 0
     for date_str in sorted(dates_to_fetch):
-        try:
-            df = ak.stock_margin_detail_sse(date=date_str)
-            if df is None or df.empty:
-                log(f"  融资融券 {date_str} 无数据，跳过")
-                continue
-            # 汇总当日全市场数据
-            margin_balance = 0
-            margin_buy = 0
-            short_sell = 0
-            short_amount = 0
-            short_volume = 0
-            for _, row in df.iterrows():
-                margin_balance += float(row.get('融资余额', 0) or 0)
-                margin_buy += float(row.get('融资买入额', 0) or 0)
-                short_sell += float(row.get('融券卖出量', 0) or 0)
-                short_amount += float(row.get('融券卖出额', 0) or 0)
-                short_volume += float(row.get('融券余量', 0) or 0)
+        success_for_day = False
+        last_err = None
 
-            conn2 = connect_db()
-            conn2.execute('''INSERT OR IGNORE INTO margin_data
-                (date, margin_balance, margin_buy, short_volume, short_amount,
-                 short_sell, total_balance) VALUES (?,?,?,?,?,?,?)''',
-                (date_str, margin_balance, margin_buy, short_volume,
-                 short_amount, short_sell, margin_balance + short_amount))
-            conn2.commit()
-            conn2.close()
-            count += 1
-        except Exception as e:
-            log(f"  融资融券 {date_str} 失败: {e}")
-        time.sleep(1)
+        for attempt in range(3):
+            try:
+                df = ak.stock_margin_detail_sse(date=date_str)
+                if df is None or df.empty:
+                    log(f"  融资融券 {date_str} 无数据，跳过")
+                    success_for_day = True
+                    break
 
-    log(f"  融资融券完成: 新增{count}天")
+                # 兼容列名变化：只聚合实际存在的列
+                def _sum_col(frame, names):
+                    for name in names:
+                        if name in frame.columns:
+                            ser = frame[name]
+                            return float(ser.fillna(0).sum())
+                    return 0.0
+
+                margin_balance = _sum_col(df, ['融资余额'])
+                margin_buy = _sum_col(df, ['融资买入额'])
+                short_sell = _sum_col(df, ['融券卖出量', '融券卖出'])
+                short_amount = _sum_col(df, ['融券卖出额'])
+                short_volume = _sum_col(df, ['融券余量'])
+
+                conn2 = connect_db()
+                conn2.execute('''INSERT OR REPLACE INTO margin_data
+                    (date, margin_balance, margin_buy, short_volume, short_amount,
+                     short_sell, total_balance) VALUES (?,?,?,?,?,?,?)''',
+                    (date_str, margin_balance, margin_buy, short_volume,
+                     short_amount, short_sell, margin_balance + short_amount))
+                conn2.commit()
+                conn2.close()
+                count += 1
+                success_for_day = True
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(1 + attempt)
+
+        if not success_for_day:
+            failed += 1
+            log(f"  融资融券 {date_str} 失败: {last_err}")
+
+    log(f"  融资融券完成: 新增{count}天, 失败{failed}天")
 
 # ============================================================
 # 11. 股东数据增量更新（抽样）
 # ============================================================
-def sync_shareholder_data():
-    log("=== 同步股东数据（滚动500只）===")
+def sync_shareholder_data(limit=500):
+    log(f"=== 同步股东数据（滚动{limit}只）===")
     try:
         import akshare as ak
     except ImportError:
@@ -720,15 +734,15 @@ def sync_shareholder_data():
         return
 
     conn = connect_db()
-    # 找出最久没更新的500只
-    stale = conn.execute('''
+    # 找出最久没更新的 limit 只
+    stale = conn.execute(f'''
         SELECT k.symbol FROM kline_daily k
         LEFT JOIN (
             SELECT symbol, MAX(created_at) as latest FROM shareholder_data GROUP BY symbol
         ) s ON k.symbol = s.symbol
         GROUP BY k.symbol
         ORDER BY COALESCE(s.latest, '2000-01-01') ASC
-        LIMIT 500
+        LIMIT {int(limit)}
     ''').fetchall()
     symbols = [r[0] for r in stale]
     conn.close()
@@ -739,28 +753,33 @@ def sync_shareholder_data():
 
     for i, symbol in enumerate(symbols):
         code = symbol[2:] if symbol.startswith(('sz', 'sh')) else symbol
-        try:
-            df = ak.stock_circulate_stock_holder(symbol=code)
-            if df is not None and not df.empty:
-                conn2 = connect_db()
-                for _, row in df.iterrows():
-                    rd = str(row.get('日期', ''))
-                    name = str(row.get('股东名称', ''))
-                    hold_num = float(row.get('持股数量', 0) or 0)
-                    hold_ratio = float(row.get('持股比例', 0) or 0)
-                    conn2.execute('''INSERT OR IGNORE INTO shareholder_data
-                        (symbol, report_date, name, shareholder_count,
-                         change_pct, avg_holdings) VALUES (?,?,?,?,?,?)''',
-                        (symbol, rd, name, int(hold_num), hold_ratio, 0))
-                    count += 1
-                conn2.commit()
-                conn2.close()
-        except:
+        success = False
+        for attempt in range(2):
+            try:
+                df = ak.stock_circulate_stock_holder(symbol=code)
+                if df is not None and not df.empty:
+                    conn2 = connect_db()
+                    for _, row in df.iterrows():
+                        rd = str(row.get('日期', ''))
+                        name = str(row.get('股东名称', ''))
+                        hold_num = float(row.get('持股数量', 0) or 0)
+                        hold_ratio = float(row.get('持股比例', 0) or 0)
+                        conn2.execute('''INSERT OR IGNORE INTO shareholder_data
+                            (symbol, report_date, name, shareholder_count,
+                             change_pct, avg_holdings) VALUES (?,?,?,?,?,?)''',
+                            (symbol, rd, name, int(hold_num), hold_ratio, 0))
+                        count += 1
+                    conn2.commit()
+                    conn2.close()
+                success = True
+                break
+            except Exception:
+                time.sleep(0.5 + attempt)
+        if not success:
             failed += 1
 
         if (i + 1) % 100 == 0:
             log(f"  股东数据进度: {i+1}/{len(symbols)} 成功{count}条 失败{failed}只")
-        time.sleep(0.3)
 
     log(f"  股东数据完成: 新增{count}条, 失败{failed}只")
 
@@ -1478,6 +1497,7 @@ def main():
     parser.add_argument('--northbound', action='store_true', help='只同步北向资金')
     parser.add_argument('--margin', action='store_true', help='只同步融资融券')
     parser.add_argument('--shareholder', action='store_true', help='只同步股东数据')
+    parser.add_argument('--shareholder-limit', type=int, default=500, help='股东数据单次更新股票数，默认500')
     parser.add_argument('--limit', action='store_true', help='只同步涨跌停')
     parser.add_argument('--news', action='store_true', help='只同步新闻')
     parser.add_argument('--review', action='store_true', help='只同步大盘复盘')
@@ -1528,7 +1548,7 @@ def main():
     if run_all or run_daily or args.margin:
         sync_margin_data()
     if run_all or run_daily or args.shareholder:
-        sync_shareholder_data()
+        sync_shareholder_data(limit=args.shareholder_limit)
     if run_all or run_daily or args.limit:
         sync_limit_up_down()
 
