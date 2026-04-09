@@ -10,18 +10,20 @@
 # 数据同步（工作日 17:00）
 0 17 * * 1-5 python3 -u /home/heqiang/.openclaw/workspace/stock-monitor-app-py/scripts/daily/update_tencent.py --no-weekly --no-monthly >> /tmp/update_tencent.log 2>&1
 
-# 布林带计算（工作日 17:05）
-5 17 * * 1-5 python3 -u /home/heqiang/.openclaw/workspace/stock-monitor-app-py/scripts/daily/calc_bollinger.py >> /tmp/calc_bollinger.log 2>&1
-
 # 每日选股推送（工作日 20:30）
 30 20 * * 1-5 cd /home/heqiang/.openclaw/workspace/stock-monitor-app-py && python3 -u scripts/daily/daily_pick_combined.py --push --wait >> /tmp/daily-pick-combined.log 2>&1
 ```
 
 ### 运行说明（已和当前逻辑对齐）
-- 推送形式：**飞书文本消息**，不是卡片。
+- 推送形式：**飞书卡片消息**（interactive card），失败时自动回退文本。
+- `update_tencent.py` 在**日更模式**下采用**当天增量补算**：
+  - 先拉当天 K 线
+  - 只对**当天有K线的股票**补 `MA/RSI`
+  - 再补当天 `BB`
 - `--wait`：20:30 任务会等待数据就绪信号。
 - 数据就绪信号仅在**有效交易日数据校验通过后**写入 `/tmp/stock_data_ready.flag`。
 - 若当天数据不完整，`daily_pick_combined.py` 会**自动回退到最近有效交易日**，避免空推或直接失败。
+- **全量重算**只保留给 `update_tencent.py --full`（周末/修复场景），不再作为日常盘后默认流程。
 
 ---
 
