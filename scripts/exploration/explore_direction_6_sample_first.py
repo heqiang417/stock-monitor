@@ -12,6 +12,7 @@
 """
 import json
 import os
+import multiprocessing as mp
 from datetime import datetime
 from itertools import product
 
@@ -28,6 +29,45 @@ from explore_direction_4_expand_test_samples import (
 OUTPUT = os.path.join(os.path.dirname(DB), 'results', 'explore_direction_6_sample_first.json')
 MIN_TRADES = 30
 MIN_WIN_RATE = 55.0
+WORKERS = max(1, int(os.environ.get('D6_WORKERS', '1')))
+
+
+def _build_label(params):
+    return (
+        f"{params['family']}_RSI{params['rsi_thresh']}_BB{params['bb_mult']:.2f}"
+        f"_VOL{params['vol_mult']}_TOP{params['top_n'] if params['top_n'] > 0 else 'ALL'}"
+        f"_{'weak'+str(params['weak_thresh']) if params['use_weak'] else 'noWeak'}"
+        f"_SL{params['stop_loss']}_TP{params['take_profit']}_H{params['max_hold_days']}"
+    )
+
+
+def _run_one_batch(args):
+    """每个worker进程：独立加载数据，独立处理一个batch。"""
+    batch, db_path = args
+    # worker进程内加载数据，避免父进程fork后内存膨胀
+    conn = sqlite3.connect(db_path, timeout=120)
+    sym_data, sym_scores_pit, weak_maps = load_data(conn)
+    conn.close()
+    results = []
+    for params in batch:
+        label = _build_label(params)
+        try:
+            res = run_backtest(sym_data, sym_scores_pit, weak_maps, params)
+            t = res['train']['metrics']
+            v = res['val']['metrics']
+            te = res['test']['metrics']
+            rates = [t['positive_rate'], v['positive_rate'], te['positive_rate']]
+            spread = round(max(rates) - min(rates), 2)
+            results.append({
+                'name': label,
+                'params': params,
+                'results': res,
+                'qualified': qualifies(res),
+                'stability_spread': spread,
+            })
+        except Exception as e:
+            results.append({'name': label, 'params': params, 'error': str(e)})
+    return results
 
 
 def build_combos():
@@ -157,6 +197,30 @@ def classify(row):
     return 'rejected_other'
 
 
+def _build_label(params):
+    return (
+        f"{params['family']}_RSI{params['rsi_thresh']}_BB{params['bb_mult']:.2f}"
+        f"_VOL{params['vol_mult']}_TOP{params['top_n'] if params['top_n'] > 0 else 'ALL'}"
+        f"_{'weak'+str(params['weak_thresh']) if params['use_weak'] else 'noWeak'}"
+        f"_SL{params['stop_loss']}_TP{params['take_profit']}_H{params['max_hold_days']}"
+    )
+
+
+def _run_one(params):
+    label = _build_label(params)
+    res = run_backtest(_GLOBALS['sym_data'], _GLOBALS['sym_scores_pit'], _GLOBALS['weak_maps'], params)
+    row = {
+        'name': label,
+        'params': params,
+        'results': res,
+        'qualified': qualifies(res),
+    }
+    row['classification'] = classify(row)
+    row['sample_first_score'] = score(row)
+    row['stability_spread'] = stable_spread(*phase_summary(row))
+    return row
+
+
 
 def main():
     log('连接数据库...')
@@ -165,49 +229,68 @@ def main():
     conn.close()
 
     combos = build_combos()
-    log(f'共 {len(combos)} 个组合待测')
+    log(f'共 {len(combos)} 个组合待测 | workers={WORKERS}')
 
     all_results = []
     qualified = []
     promising_sample_first = []
 
-    for idx, params in enumerate(combos, 1):
-        label = (
-            f"{params['family']}_RSI{params['rsi_thresh']}_BB{params['bb_mult']:.2f}"
-            f"_VOL{params['vol_mult']}_TOP{params['top_n'] if params['top_n'] > 0 else 'ALL'}"
-            f"_{'weak'+str(params['weak_thresh']) if params['use_weak'] else 'noWeak'}"
-            f"_SL{params['stop_loss']}_TP{params['take_profit']}_H{params['max_hold_days']}"
-        )
-        log(f'[{idx}/{len(combos)}] {label}')
-        try:
-            res = run_backtest(sym_data, sym_scores_pit, weak_maps, params)
-        except Exception as e:
-            log(f'  ERROR: {e}')
-            continue
+    if WORKERS <= 1:
+        _init_worker(sym_data, sym_scores_pit, weak_maps)
+        for idx, params in enumerate(combos, 1):
+            label = _build_label(params)
+            log(f'[{idx}/{len(combos)}] {label}')
+            try:
+                row = _run_one(params)
+            except Exception as e:
+                log(f'  ERROR: {e}')
+                continue
 
-        row = {
-            'name': label,
-            'params': params,
-            'results': res,
-            'qualified': qualifies(res),
-        }
-        row['classification'] = classify(row)
-        row['sample_first_score'] = score(row)
-        row['stability_spread'] = stable_spread(*phase_summary(row))
-        all_results.append(row)
+            all_results.append(row)
+            t, v, te = phase_summary(row)
+            log(
+                f"  train {t['total_trades']} / {t['positive_rate']:.2f}% | "
+                f"val {v['total_trades']} / {v['positive_rate']:.2f}% | "
+                f"test {te['total_trades']} / {te['positive_rate']:.2f}% | "
+                f"spread {row['stability_spread']:.2f} | test Sharpe {te['sharpe']:.2f}"
+            )
 
-        t, v, te = phase_summary(row)
-        log(
-            f"  train {t['total_trades']} / {t['positive_rate']:.2f}% | "
-            f"val {v['total_trades']} / {v['positive_rate']:.2f}% | "
-            f"test {te['total_trades']} / {te['positive_rate']:.2f}% | "
-            f"spread {row['stability_spread']:.2f} | test Sharpe {te['sharpe']:.2f}"
-        )
+            if row['classification'] == 'qualified':
+                qualified.append(row)
+            elif te['total_trades'] >= MIN_TRADES:
+                promising_sample_first.append(row)
+    else:
+        future_to_meta = {}
+        with ProcessPoolExecutor(max_workers=WORKERS, initializer=_init_worker, initargs=(sym_data, sym_scores_pit, weak_maps)) as ex:
+            for idx, params in enumerate(combos, 1):
+                label = _build_label(params)
+                future = ex.submit(_run_one, params)
+                future_to_meta[future] = (idx, label)
 
-        if row['classification'] == 'qualified':
-            qualified.append(row)
-        elif te['total_trades'] >= MIN_TRADES:
-            promising_sample_first.append(row)
+            done_count = 0
+            for future in as_completed(future_to_meta):
+                idx, label = future_to_meta[future]
+                done_count += 1
+                log(f'[{done_count}/{len(combos)}] done #{idx}: {label}')
+                try:
+                    row = future.result()
+                except Exception as e:
+                    log(f'  ERROR: {e}')
+                    continue
+
+                all_results.append(row)
+                t, v, te = phase_summary(row)
+                log(
+                    f"  train {t['total_trades']} / {t['positive_rate']:.2f}% | "
+                    f"val {v['total_trades']} / {v['positive_rate']:.2f}% | "
+                    f"test {te['total_trades']} / {te['positive_rate']:.2f}% | "
+                    f"spread {row['stability_spread']:.2f} | test Sharpe {te['sharpe']:.2f}"
+                )
+
+                if row['classification'] == 'qualified':
+                    qualified.append(row)
+                elif te['total_trades'] >= MIN_TRADES:
+                    promising_sample_first.append(row)
 
     all_results.sort(key=score, reverse=True)
     qualified.sort(key=score, reverse=True)
