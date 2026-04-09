@@ -6,12 +6,12 @@
 
 ## L2 策略研究
 
-**入口**：[策略总览 INDEX](strategy/INDEX.md)
+**入口**：[策略总览](strategy/STRATEGY_INDEX.md)
 
 | 层级 | 内容 |
 |------|------|
-| **L2** | [策略总览 INDEX](strategy/INDEX.md) — 所有策略一张表 |
-| **L3** | [Fstop3_pt5 v10 手册](strategy/Fstop3_pt5_v10/) — 实盘策略 |
+| **L2** | [策略总览](strategy/STRATEGY_INDEX.md) — 所有策略一张表 |
+| **L3** | [Fstop3_pt5 v10 手册](strategy/Fstop3_pt5_v10/) — 历史/对照策略 |
 | **L3** | [BB+KDJ 候选策略](strategy/BB_KDJ_Weak/) — 待上线 |
 
 ---
