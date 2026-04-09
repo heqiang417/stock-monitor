@@ -58,7 +58,7 @@
 | 策略 | 脚本 | 触发时间 | 持有规则 | 手册 |
 |------|------|---------|---------|------|
 | **BB1.00** | daily_pick_combined.py | 工作日 20:30 | 固定7天 | [手册](../strategy/BB1.00/README.md) |
-| **BB1.02+KDJ** | daily_pick_combined.py | 工作日 20:30 | 固定7天 | [手册](../strategy/BB1.00/README.md)（BB1.00手册代） |
+| **BB1.02+KDJ** | daily_pick_combined.py | 工作日 20:30 | 固定7天 | [手册](../strategy/BB_KDJ_Weak/README.md) |
 
 > 注：Fstop3_pt5 v10 已降级为历史/对照策略，不再属于正式每日策略池。
 
