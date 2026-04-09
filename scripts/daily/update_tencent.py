@@ -274,9 +274,71 @@ def sync_monthly_kline():
 # 4. 技术指标重算（本地计算，不依赖外部API）
 # ============================================================
 
-def recalc_technical_indicators():
+def recalc_technical_indicators(target_date=None):
     log("=== 重算技术指标 (MA/RSI) ===")
     conn = sqlite3.connect(DB_PATH)
+
+    # 增量模式：只处理目标日有K线的股票，并且只更新目标日这一行
+    if target_date:
+        symbols = [r[0] for r in conn.execute(
+            'SELECT DISTINCT symbol FROM kline_daily WHERE trade_date=?',
+            (target_date,)
+        ).fetchall()]
+        updated_rows = 0
+
+        for i, symbol in enumerate(symbols, 1):
+            rows = conn.execute(
+                'SELECT rowid, trade_date, close FROM kline_daily WHERE symbol=? ORDER BY trade_date',
+                (symbol,)
+            ).fetchall()
+            if len(rows) < 20:
+                continue
+
+            closes = [r[2] for r in rows]
+            updates = []
+            for j, (rowid, trade_date, close) in enumerate(rows):
+                if trade_date != target_date:
+                    continue
+
+                ma5 = round(sum(closes[max(0, j-4):j+1]) / min(5, j+1), 2)
+                ma10 = round(sum(closes[max(0, j-9):j+1]) / min(10, j+1), 2)
+                ma20 = round(sum(closes[max(0, j-19):j+1]) / min(20, j+1), 2)
+                ma60 = round(sum(closes[max(0, j-59):j+1]) / min(60, j+1), 2)
+
+                rsi14 = None
+                if j >= 14:
+                    gains, losses = [], []
+                    for k in range(j-13, j+1):
+                        change = closes[k] - closes[k-1]
+                        gains.append(max(change, 0))
+                        losses.append(max(-change, 0))
+                    avg_gain = sum(gains) / 14
+                    avg_loss = sum(losses) / 14
+                    if avg_loss == 0:
+                        rsi14 = 100.0
+                    else:
+                        rs = avg_gain / avg_loss
+                        rsi14 = round(100 - 100 / (1 + rs), 2)
+
+                    updates.append((ma5, ma10, ma20, ma60, rsi14, ma20, rowid))
+
+            if updates:
+                conn.executemany(
+                    'UPDATE kline_daily SET ma5=?, ma10=?, ma20=?, ma60=?, rsi14=?, boll_mid=? WHERE rowid=?',
+                    updates
+                )
+                updated_rows += len(updates)
+
+            if i % 500 == 0:
+                conn.commit()
+                log(f"  技术指标进度: {i}/{len(symbols)}")
+
+        conn.commit()
+        conn.close()
+        log(f"  技术指标完成: 目标日 {target_date} 更新 {updated_rows} 行")
+        return
+
+    # 兼容原有全量模式
     symbols = [r[0] for r in conn.execute(
         'SELECT DISTINCT symbol FROM kline_daily').fetchall()]
     updated = 0
@@ -438,8 +500,8 @@ def main():
         # 1. 日K线
         sync_daily_kline()
 
-        # 2. 技术指标重算（始终执行，K线更新后必须重算）
-        recalc_technical_indicators()
+        # 2. 技术指标重算（增量模式：只补今天；全量模式：全量重算）
+        recalc_technical_indicators(TODAY if not args.full else None)
 
         # 3. 周K线（--no-weekly 时跳过，仅周日全量跑）
         if not args.no_weekly:

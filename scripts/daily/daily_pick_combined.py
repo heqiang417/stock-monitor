@@ -571,15 +571,6 @@ elements = [
     {"tag": "hr"},
 ]
 
-# Fstop3 v10 - 动态读取评估结果
-fstop3_metric = STRATEGY_METRICS.get('Fstop3_pt5_v10', '⚠️ 回测指标待更新')
-elements += build_section(
-    title="策略1️⃣ Fstop3_pt5（RSI<18 + BB触底 + 放量1.5x + 弱市50%）",
-    picks=picks_v10,
-    cond_md=f"回测参考：{fstop3_metric}",
-    note_md="建议：T+1开盘买 | 止损3%止盈5% | 持有个≤10天了结",
-    show_vol=True,
-)
 # BB1.00 - 动态读取评估结果
 bb100_metric = STRATEGY_METRICS.get('BB1.00', '⚠️ 回测指标待更新')
 elements += build_section(
@@ -607,10 +598,16 @@ elements += build_section(
 )
 
 
-elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 四策略组合 | 不构成投资建议"}]})
+elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 正式策略3只 | 不构成投资建议"}]})
 
-card = {"elements": elements}
-
+card = {
+    "config": {"wide_screen_mode": True},
+    "header": {
+        "title": {"tag": "plain_text", "content": f"📈 每日选股 {latest} | 正式策略池"},
+        "template": "green"
+    },
+    "elements": elements
+}
 APP_ID = os.environ.get("APP_ID_BOT2", "cli_a938ffaf9738dbc6")
 APP_SECRET = os.environ.get("APP_SECRET_BOT2", "ulvmnUvH1VBlqgPq298isdQ1VFURenaR")
 OPEN_ID = os.environ.get("OPEN_ID_USER", "ou_8822a58f429ea317ab49166d79533b0f")  # 何强本人
@@ -659,7 +656,6 @@ def build_text_message():
         "T+1开盘买 | 止损3.5%止盈4.0% | 持有5天了结",
         show_vol=True,
     )
-    lines.append("注：Fstop3_pt5 已降级为历史/对照策略，不参与正式每日推送")
     lines.append(f"数据：{latest} | 正式策略3只 | 不构成投资建议")
     return "\n".join(lines)
 
@@ -671,35 +667,61 @@ token = r.json().get('tenant_access_token')
 if not token:
     print("获取token失败"); db.close(); exit(1)
 
-# 私聊推送（默认，文本格式）
+# 私聊推送（默认，卡片格式）
 r2 = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
     params={'receive_id_type': 'open_id'},
     headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
     json={
         'receive_id': OPEN_ID,
-        'msg_type': 'text',
-        'content': json.dumps({'text': text_msg})
+        'msg_type': 'interactive',
+        'content': json.dumps(card, ensure_ascii=False)
     })
 resp = r2.json()
 if resp.get('code') == 0:
-    print(f"飞书私聊推送成功")
+    print(f"飞书私聊卡片推送成功")
 else:
-    print(f"飞书私聊推送失败: {resp}")
+    print(f"飞书私聊卡片推送失败，回退文本: {resp}")
+    r2_fallback = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
+        params={'receive_id_type': 'open_id'},
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+        json={
+            'receive_id': OPEN_ID,
+            'msg_type': 'text',
+            'content': json.dumps({'text': text_msg}, ensure_ascii=False)
+        })
+    resp_fb = r2_fallback.json()
+    if resp_fb.get('code') == 0:
+        print("飞书私聊文本回退成功")
+    else:
+        print(f"飞书私聊文本回退也失败: {resp_fb}")
 
-# 群里推送（仅 --also-group 时，文本格式）
+# 群里推送（仅 --also-group 时，优先卡片）
 if args.also_group:
     r3 = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
         params={'receive_id_type': 'chat_id'},
         headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
         json={
             'receive_id': GROUP_ID,
-            'msg_type': 'text',
-            'content': json.dumps({'text': text_msg})
+            'msg_type': 'interactive',
+            'content': json.dumps(card, ensure_ascii=False)
         })
     resp3 = r3.json()
     if resp3.get('code') == 0:
-        print(f"飞书群推送成功")
+        print(f"飞书群卡片推送成功")
     else:
-        print(f"飞书群推送失败: {resp3}")
+        print(f"飞书群卡片推送失败，回退文本: {resp3}")
+        r3_fallback = requests.post('https://open.feishu.cn/open-apis/im/v1/messages',
+            params={'receive_id_type': 'chat_id'},
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={
+                'receive_id': GROUP_ID,
+                'msg_type': 'text',
+                'content': json.dumps({'text': text_msg}, ensure_ascii=False)
+            })
+        resp3_fb = r3_fallback.json()
+        if resp3_fb.get('code') == 0:
+            print("飞书群文本回退成功")
+        else:
+            print(f"飞书群文本回退也失败: {resp3_fb}")
 
 db.close()
