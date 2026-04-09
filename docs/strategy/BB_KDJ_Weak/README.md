@@ -1,6 +1,6 @@
 # BB + KDJ Oversold + RSI 策略手册
 
-> 候选策略 | 待上线 | 2026-04-03
+> 策略手册 | 正式策略（与 BB1.00 组合运行） | 2026-04-09
 
 ---
 
@@ -30,13 +30,11 @@
 
 ---
 
-## 实盘建议
+## 当前状态
 
-BB1.02+KDJ 系列尚未上实盘，建议：
+BB1.02+KDJ 已与 BB1.00 一同纳入每日策略池（`daily_pick_combined.py`），组合运行。
 
-1. **先用防御型**（TOP200+7天持有，MDD仅15.7%）做模拟盘验证1个月
-2. 观察每日选股数量和实际收益是否与回测接近
-3. 确认后替换crontab中的策略
+TOP500+7天作为进攻首选，TOP200+7天作为防御补充。
 
 ---
 
@@ -50,5 +48,5 @@ BB1.02+KDJ 系列尚未上实盘，建议：
 ## 相关文档
 
 - 📊 [完整回测报告](backtest_report.md)
-- 📋 [STRATEGY_INDEX（总览）](../INDEX.md)
+- 📋 [STRATEGY_INDEX（总览）](../STRATEGY_INDEX.md)
 - 📐 [EVAL_FRAMEWORK.md](../../EVAL_FRAMEWORK.md)

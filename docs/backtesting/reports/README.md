@@ -1,6 +1,6 @@
 # 回测报告目录
 
-> L3 回测验证 | 入口：[strategy/INDEX.md](../../strategy/INDEX.md)
+> L3 回测验证 | 入口：[strategy/STRATEGY_INDEX.md](../../strategy/STRATEGY_INDEX.md)
 
 ---
 
@@ -60,4 +60,4 @@
 
 - [28项指标定义](../metrics_definitions.md)
 - [EVAL_FRAMEWORK.md](../../EVAL_FRAMEWORK.md)
-- [策略总览 INDEX](../../strategy/INDEX.md)
+- [策略总览](../../strategy/STRATEGY_INDEX.md)

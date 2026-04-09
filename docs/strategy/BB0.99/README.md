@@ -59,5 +59,5 @@ BB0.99 比 BB1.00 条件更严格（需跌破布林下轨1%以上），但测试
 ## 相关文档
 
 - 📊 [完整回测报告](backtest_report.md)
-- 📋 [STRATEGY_INDEX（总览）](../INDEX.md)
+- 📋 [STRATEGY_INDEX（总览）](../STRATEGY_INDEX.md)
 - 📐 [EVAL_FRAMEWORK.md](../../EVAL_FRAMEWORK.md)
