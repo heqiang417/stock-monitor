@@ -103,6 +103,7 @@
 
 ## 相关文档
 
+- [策略变更影响清单](STRATEGY_CHANGE_CHECKLIST.md)
 - [Fstop3_pt5 v10 策略手册](Fstop3_pt5_v10/README.md)
 - [Fstop3_pt5 v10 回测报告](../backtesting/reports/Fstop3_pt5_v10.md)
 - [BB1.00 策略手册](BB1.00/README.md)
