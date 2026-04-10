@@ -165,6 +165,9 @@ args = parser.parse_args()
 
 DB_PATH = os.environ.get('STOCK_DB', '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db')
 READY_FLAG = '/tmp/stock_data_ready.flag'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+UPDATE_TENCENT = os.path.join(SCRIPT_DIR, 'update_tencent.py')
+DAILY_SYNC = os.path.join(SCRIPT_DIR, 'daily_sync.py')
 TODAY = datetime.now().strftime('%Y-%m-%d')
 MIN_STOCKS = 4000
 VALID_LOOKBACK_DAYS = 10
@@ -252,6 +255,7 @@ def get_trade_day_gap(db, from_date, to_date):
 
 def validate(db, date):
     errors = []
+    warnings = []
     total = db.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{date}'").fetchone()[0]
     if total < MIN_STOCKS:
         errors.append(f"K线不足: {total}只")
@@ -261,14 +265,144 @@ def validate(db, date):
         errors.append(f"RSI未计算: {has_rsi}/{total}")
     if has_bb < total * 0.8:
         errors.append(f"BB未计算: {has_bb}/{total}")
-    return errors, {"total": total, "rsi": has_rsi, "bb": has_bb}
+
+    def max_date(table, col):
+        try:
+            row = db.execute(f"SELECT MAX({col}) FROM {table}").fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    ext = {
+        'valuation': max_date('daily_valuation', 'trade_date'),
+        'index': max_date('kline_daily_index', 'trade_date'),
+        'capital_flow': max_date('capital_flow', 'trade_date'),
+        'northbound': max_date('northbound_flow', 'date'),
+        'margin': max_date('margin_data', 'date'),
+        'limit_up_down': max_date('limit_up_down', 'date'),
+        'news': max_date('news_daily', 'publish_date'),
+        'review': max_date('market_review', 'trade_date'),
+        'chip': max_date('chip_distribution', 'trade_date'),
+        'lhb': max_date('lhb_detail', 'trade_date'),
+        'block': max_date('block_trades', 'trade_date'),
+        'shareholder': max_date('shareholder_data', 'announcement_date') or max_date('shareholder_data', 'report_date'),
+    }
+
+    # 这些先作为选股前可见告警，不阻塞当前流程；未来策略真依赖时再升级为硬错误
+    for key, value in ext.items():
+        if not value:
+            warnings.append(f"{key}无数据")
+            continue
+        if str(value) < str(date):
+            warnings.append(f"{key}未到目标日: 最新{value}")
+
+    return errors, {
+        'total': total,
+        'rsi': has_rsi,
+        'bb': has_bb,
+        'warnings': warnings,
+        'ext': ext,
+    }
+
+
+def try_repair_before_pick(target_date):
+    """选股前兜底补齐：先触发基础数据同步，再触发扩展数据同步。"""
+    repaired_tencent = False
+    repaired_extended = False
+
+    # Step 1: 基础数据（K线 + 指数K线 + 估值）
+    if os.path.exists(UPDATE_TENCENT):
+        print(f"[补齐 Step1/2] 同步基础数据: {os.path.basename(UPDATE_TENCENT)}")
+        try:
+            r = subprocess.run(
+                [sys.executable, UPDATE_TENCENT, '--no-weekly', '--no-monthly'],
+                cwd=SCRIPT_DIR,
+                capture_output=True,
+                text=True,
+                timeout=60 * 30,
+                check=False,
+            )
+            if r.stdout:
+                for line in r.stdout.strip().split('\n')[-10:]:
+                    print(f"  {line}")
+            if r.stderr and 'Error' in r.stderr:
+                print(f"  [基础同步 stderr] {r.stderr.strip()[:200]}")
+            repaired_tencent = (r.returncode == 0)
+            print(f"[补齐 Step1] 基础数据同步{'成功' if repaired_tencent else '失败(继续)'}")
+        except subprocess.TimeoutExpired:
+            print("[补齐 Step1] 基础数据同步超时，跳过")
+        except Exception as e:
+            print(f"[补齐 Step1] 基础数据同步异常: {e}")
+
+    # Step 2: 扩展数据（为未来策略依赖预先补齐）
+    # 包含：北向、融资融券、涨跌停、资金流、行业、股东、新闻、复盘、筹码、龙虎榜、大宗
+    if os.path.exists(DAILY_SYNC):
+        extended_flags = [
+            '--northbound',
+            '--margin',
+            '--limit',
+            '--flow',
+            '--industry',
+            '--shareholder',
+            '--shareholder-limit', '1000',
+            '--news',
+            '--review',
+            '--chip',
+            '--lhb',
+            '--block',
+        ]
+        print(f"[补齐 Step2/2] 同步扩展数据: {' '.join(extended_flags)}")
+        try:
+            cmd = [sys.executable, DAILY_SYNC] + extended_flags
+            r = subprocess.run(
+                cmd,
+                cwd=SCRIPT_DIR,
+                capture_output=True,
+                text=True,
+                timeout=60 * 45,
+                check=False,
+            )
+            if r.stdout:
+                for line in r.stdout.strip().split('\n')[-15:]:
+                    print(f"  {line}")
+            if r.stderr and 'Error' in r.stderr:
+                print(f"  [扩展同步 stderr] {r.stderr.strip()[:200]}")
+            repaired_extended = (r.returncode == 0)
+            print(f"[补齐 Step2] 扩展数据同步{'成功' if repaired_extended else '失败(继续)'}")
+        except subprocess.TimeoutExpired:
+            print("[补齐 Step2] 扩展数据同步超时，跳过")
+        except Exception as e:
+            print(f"[补齐 Step2] 扩展数据同步异常: {e}")
+    else:
+        print(f"[补齐 Step2] 未找到扩展同步脚本: {DAILY_SYNC}")
+
+    return repaired_tencent or repaired_extended
 
 errors, stats = validate(db, latest)
+if errors and not args.date:
+    print(f"首次校验失败，准备补齐后重试: {errors}")
+    repaired = try_repair_before_pick(latest)
+    if repaired:
+        db.close()
+        db = sqlite3.connect(DB_PATH)
+        db.execute('PRAGMA journal_mode=WAL')
+        latest_total = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest,)).fetchone()[0]
+        if latest_total < MIN_STOCKS:
+            fallback = get_latest_valid_trade_date(db)
+            if fallback and fallback != latest:
+                print(f"补齐后当前日期仍不足({latest_total}只)，自动回退到: {fallback}")
+                latest = fallback
+        errors, stats = validate(db, latest)
+
 if errors:
     print(f"数据校验失败: {errors}")
     db.close()
     exit(1)
 print(f"数据校验通过 ({latest}): K线{stats['total']} RSI{stats['rsi']} BB{stats['bb']}")
+if stats.get('warnings'):
+    print("扩展数据告警:")
+    for w in stats['warnings']:
+        print(f"  ⚠️ {w}")
 
 latest_trade = get_latest_trade_date(db)
 stale_trade_days = get_trade_day_gap(db, latest, latest_trade) if latest_trade else None

@@ -5,10 +5,11 @@
 
 同步内容：
 1. 日K线（腾讯）+ 技术指标重算
-2. 周K线（腾讯）
-3. 月K线（腾讯）
-4. 估值数据 PE/PB（腾讯实时 → 写入当日）
-5. 财务指标（akshare fallback）
+2. 指数日K线（腾讯）+ 技术指标重算
+3. 周K线（腾讯）
+4. 月K线（腾讯）
+5. 估值数据 PE/PB（腾讯实时 → 写入当日）
+6. 财务指标（akshare fallback）
 
 用法：
   python3 update_tencent.py              # 默认增量1天
@@ -35,6 +36,15 @@ DB_PATH = os.environ.get('STOCK_DB',
 STOCKS_FILE = os.environ.get('STOCKS_FILE',
     '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/stock_data_full.json')
 READY_FLAG = '/tmp/stock_data_ready.flag'
+INDEX_SYMBOLS = [
+    'sh000001',  # 上证指数
+    'sz399001',  # 深证成指
+    'sz399006',  # 创业板指
+    'sh000688',  # 科创50
+    'sh000300',  # 沪深300
+    'sh000905',  # 中证500
+    'sh000852',  # 中证1000
+]
 
 # === 参数解析 ===
 parser = argparse.ArgumentParser(description='腾讯股票数据更新')
@@ -95,6 +105,7 @@ def _get_session():
 def fetch_tencent_kline(symbol, period='day'):
     """腾讯财经API获取K线（日/周/月）
     period: day / week / month
+    支持普通股票(symbol=sz000001/sh600000)和指数(symbol=sh000001/sz399001)
     """
     if symbol.startswith('sz'):
         tsym = f'sz{symbol[2:]}'
@@ -243,7 +254,113 @@ def sync_daily_kline():
 
 
 # ============================================================
-# 2. 周K线更新（腾讯）
+# 2. 指数日K线更新（腾讯）
+# ============================================================
+
+def sync_index_daily_kline():
+    log("=== [腾讯] 同步指数日K线 ===")
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('''CREATE TABLE IF NOT EXISTS kline_daily_index (
+            symbol TEXT,
+            trade_date TEXT,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume REAL,
+            amount REAL,
+            pct_change REAL,
+            ma5 REAL,
+            ma10 REAL,
+            ma20 REAL,
+            rsi14 REAL,
+            PRIMARY KEY (symbol, trade_date)
+        )''')
+        conn.commit()
+        conn.close()
+
+    completed, failed = 0, 0
+    for sym in INDEX_SYMBOLS:
+        klines = fetch_tencent_kline(sym, 'day')
+        if not klines:
+            failed += 1
+            continue
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute('PRAGMA journal_mode=WAL')
+            c = conn.cursor()
+            for k in klines:
+                try:
+                    c.execute('''INSERT INTO kline_daily_index
+                        (symbol, trade_date, open, high, low, close, volume, amount, pct_change)
+                        VALUES (?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                        open=excluded.open, high=excluded.high, low=excluded.low,
+                        close=excluded.close, volume=excluded.volume, amount=excluded.amount,
+                        pct_change=excluded.pct_change''',
+                        (sym, k['trade_date'], k['open'], k['high'], k['low'], k['close'],
+                         k['volume'], k['amount'], k['chg_pct']))
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        completed += 1
+
+    log(f'  指数日K线完成: 成功 {completed}, 失败 {failed}')
+    recalc_index_technical_indicators()
+    return completed, failed
+
+
+def recalc_index_technical_indicators():
+    log("=== 重算指数技术指标 (MA/RSI) ===")
+    conn = sqlite3.connect(DB_PATH)
+    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily_index').fetchall()]
+
+    for symbol in symbols:
+        rows = conn.execute(
+            'SELECT rowid, close FROM kline_daily_index WHERE symbol=? ORDER BY trade_date',
+            (symbol,)
+        ).fetchall()
+        if len(rows) < 20:
+            continue
+
+        closes = [r[1] for r in rows]
+        updates = []
+        for j, (rowid, close) in enumerate(rows):
+            ma5 = round(sum(closes[max(0, j-4):j+1]) / min(5, j+1), 2)
+            ma10 = round(sum(closes[max(0, j-9):j+1]) / min(10, j+1), 2)
+            ma20 = round(sum(closes[max(0, j-19):j+1]) / min(20, j+1), 2)
+
+            rsi14 = None
+            if j >= 14:
+                gains, losses = [], []
+                for k in range(j-13, j+1):
+                    change = closes[k] - closes[k-1]
+                    gains.append(max(change, 0))
+                    losses.append(max(-change, 0))
+                avg_gain = sum(gains) / 14
+                avg_loss = sum(losses) / 14
+                if avg_loss == 0:
+                    rsi14 = 100.0
+                else:
+                    rs = avg_gain / avg_loss
+                    rsi14 = round(100 - 100 / (1 + rs), 2)
+            updates.append((ma5, ma10, ma20, rsi14, rowid))
+
+        conn.executemany(
+            'UPDATE kline_daily_index SET ma5=?, ma10=?, ma20=?, rsi14=? WHERE rowid=?',
+            updates
+        )
+
+    conn.commit()
+    conn.close()
+    log(f"  指数技术指标完成: {len(symbols)} 个指数")
+
+
+# ============================================================
+# 3. 周K线更新（腾讯）
 # ============================================================
 
 def sync_weekly_kline():
@@ -500,25 +617,28 @@ def main():
         # 1. 日K线
         sync_daily_kline()
 
-        # 2. 技术指标重算（增量模式：只补今天；全量模式：全量重算）
+        # 2. 指数日K线 + 指标
+        sync_index_daily_kline()
+
+        # 3. 技术指标重算（增量模式：只补今天；全量模式：全量重算）
         recalc_technical_indicators(TODAY if not args.full else None)
 
-        # 3. 周K线（--no-weekly 时跳过，仅周日全量跑）
+        # 4. 周K线（--no-weekly 时跳过，仅周日全量跑）
         if not args.no_weekly:
             sync_weekly_kline()
 
-        # 4. 月K线（--no-monthly 时跳过，仅周日全量跑）
+        # 5. 月K线（--no-monthly 时跳过，仅周日全量跑）
         if not args.no_monthly:
             sync_monthly_kline()
 
-        # 5. 估值数据
+        # 6. 估值数据
         sync_valuation()
 
-        # 6. 财务指标（仅全量或周末）
+        # 7. 财务指标（仅全量或周末）
         if args.full:
             sync_financial_indicators()
 
-        # 7. 增量算今天布林带（必须在 READY_FLAG 之前完成）
+        # 8. 增量算今天布林带（必须在 READY_FLAG 之前完成）
         _calc_today_bollinger()
 
         # 最终校验（布林带算完后再决定是否发就绪信号）

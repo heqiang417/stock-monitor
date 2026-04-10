@@ -10,9 +10,10 @@
 核心主线只有四步：
 
 1. **同步市场数据**
-2. **计算技术指标 / 校验数据可用性**
-3. **运行当前在用策略**
-4. **推送每日选股结果到飞书**
+2. **补齐 / 校验数据可用性**
+3. **计算技术指标**
+4. **运行当前在用策略**
+5. **推送每日选股结果到飞书**
 
 所以它不是一个泛化量化平台，而是一个：
 
@@ -26,10 +27,10 @@
 
 | 入口 | 作用 |
 |------|------|
-| `scripts/daily/update_tencent.py` | 收盘后主数据同步 |
+| `scripts/daily/update_tencent.py` | 收盘后主数据同步（含当天增量补算） |
 | `scripts/daily/calc_bollinger.py` | 计算/补齐布林带 |
 | `scripts/daily/daily_sync.py` | 补充北向/两融/股东/新闻/复盘/筹码等扩展数据 |
-| `scripts/daily/daily_pick_combined.py` | **当前唯一在用的每日选股入口** |
+| `scripts/daily/daily_pick_combined.py` | **当前唯一在用的每日选股入口**（选股前先校验，必要时自动补齐） |
 | `docs/ops/crontab.md` | 当前定时任务运行说明 |
 
 ### 当前在用策略
@@ -165,6 +166,7 @@ stock-monitor-app-py/
 - 看 `scripts/daily/`
 - 看 `docs/ops/crontab.md`
 - 看 `daily_pick_combined.py`
+- 现在的真实顺序是：**数据同步/补齐 → 校验 → 指标可用 → 选股 → 推送**
 
 ---
 
