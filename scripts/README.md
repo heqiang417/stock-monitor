@@ -27,10 +27,10 @@ scripts/
 
 | 脚本 | 角色 | 状态 |
 |------|------|------|
-| `update_tencent.py` | 主数据同步入口 | 在用 |
+| `update_tencent.py` | 主数据同步入口（股票K线 + 指数K线 + MA/RSI/BB + PE/PB） | 在用 |
 | `calc_bollinger.py` | 布林带计算 | 在用 |
-| `daily_sync.py` | 扩展数据补充入口 | 在用 |
-| `daily_pick_combined.py` | **当前唯一在用的每日选股入口** | 在用 |
+| `daily_sync.py` | 扩展数据补充入口（北向/两融/股东/新闻/复盘/筹码/涨跌停/龙虎榜/大宗/资金流/行业） | 在用 |
+| `daily_pick_combined.py` | **当前唯一在用的每日选股入口**（含双阶段补齐 + 扩展数据告警校验） | 在用 |
 
 ### 历史生产脚本（仍保留，但不是当前官方入口）
 
@@ -124,6 +124,12 @@ scripts/
 强哥确认
   ↓
 进入生产层（daily_pick_combined.py / cron）
+
+当前生产真实链路：
+- **17:00** `update_tencent.py`
+- **17:30** `daily_sync.py`
+- **20:30** `daily_pick_combined.py --push --wait`
+- 若数据不完整：`daily_pick_combined.py` 会触发**基础 + 扩展双阶段兜底补齐**
 ```
 
 ---
