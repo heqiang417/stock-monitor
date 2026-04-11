@@ -5,7 +5,7 @@
 正式策略（均满足三阶段正率>55%，测试样本>=30）：
   1. BB1.00：RSI<20 + BB<=1.00 + 弱市70% + 7天持有
   2. BB1.02+KDJ Oversold：RSI<20 + BB<=1.02 + KDJ超卖 + 弱市70% + TOP500
-  3. 策略A（新）：RSI<19 + BB<=1.00 + 放量1.1x + 弱市40% + TOP800 + 止损3.5%/止盈4.0% + 持有5天
+  3. 策略A（新）：RSI<19 + BB<=1.00 + 放量1.1x + 无弱市过滤 + TOP800 + 止损3.5%/止盈4.0% + 持有5天
 
 Fstop3_pt5 v10：已降级为历史/对照策略，不再纳入正式每日策略池。
 
@@ -102,12 +102,13 @@ def load_strategy_metrics():
             print(f"[BB1.02_KDJ指标加载失败] {e}", flush=True)
             pass
 
-    # 策略A（RSI19 + BB1.00 + VOL1.1 + weak0.4 + TOP800 + SL3.5/TP4.0 + H5）
-    # 指标直接硬编码（来自 direction7 精修结果，eval 已确认合格）
+    # 策略A（RSI19 + BB1.00 + VOL1.1 + noWeak + TOP800 + SL3.5/TP4.0 + H5）
+    # 指标来自 direction7 精修回测（refine_main RSI19 BB1.00 VOL1.1 TOP800 noWeak SL3.5 TP4.0 H5）
+    # 注意：生产 daily_pick_combined.py 仅发射信号，实际 SL/TP 由用户买入时自行执行
     metrics['StrategyA'] = (
-        f"三阶段胜率 56.8%/76.2%/67.1% | "
-        f"夏普 1.20/7.07/2.78 | "
-        f"测试143笔"
+        f"三阶段胜率 56.4%/75.5%/68.5% | "
+        f"夏普 1.20/7.07/3.05 | "
+        f"测试143笔 | 回测含SL/TP，实盘需用户自执行"
     )
 
     return metrics
@@ -590,11 +591,10 @@ else:
     picks_kdj = []
     print("策略未通过门槛，已跳过")
 
-# === 正式策略3: 策略A（RSI19 + BB1.00 + VOL1.1 + weak40% + TOP800 + SL3.5/TP4.0 + H5）===
-print(f"\n=== 策略A（RSI19+BB1.00+VOL1.1+弱市40%+TOP800）===")
-market_ok_40 = weak_pct >= 40
-print(f"大盘弱市40%阈值: {'✅' if market_ok_40 else '❌'}（当前{weak_pct:.1f}%）")
-if STRATEGY_QUALIFIED.get('StrategyA', False) and market_ok_40:
+# === 正式策略3: 策略A（RSI19 + BB1.00 + VOL1.1 + noWeak + TOP800 + SL3.5/TP4.0 + H5）===
+print(f"\n=== 策略A（RSI19+BB1.00+VOL1.1+无弱市过滤+TOP800）===")
+print(f"大盘弱市 {weak_pct:.1f}%（无过滤阈值，每日参与）")
+if STRATEGY_QUALIFIED.get('StrategyA', False):
     top800_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:800]}
     placeholders = ','.join(f'"{s}"' for s in top800_syms)
     cond_sql_a = (
@@ -619,10 +619,7 @@ if STRATEGY_QUALIFIED.get('StrategyA', False) and market_ok_40:
         print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f} 放量{p[4]:.2f}x")
 else:
     picks_a = []
-    if not STRATEGY_QUALIFIED.get('StrategyA', False):
-        print("策略未通过门槛，已跳过")
-    else:
-        print(f"今日弱市不足40%（当前{weak_pct:.1f}%），跳过")
+    print("策略未通过门槛，已跳过")
 
 # === 历史记录 ===
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'reports', 'daily_picks')
@@ -724,10 +721,10 @@ elements += build_section(
 # 策略A - 动态读取评估结果
 strategy_a_metric = STRATEGY_METRICS.get('StrategyA', '⚠️ 回测指标待更新')
 elements += build_section(
-    title="正式策略3️⃣ 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 弱市40% + TOP800 + 持有5天）",
+    title="正式策略3️⃣ 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 无弱市 + TOP800 + 持有5天）",
     picks=picks_a,
     cond_md=f"回测：{strategy_a_metric}",
-    note_md="建议：T+1开盘买 | 止损3.5%止盈4.0% | 持有5天了结",
+    note_md="建议：T+1开盘买 | 止损3.5% / 止盈4.0% | 最多持有5天（用户需自执行SL/TP）",
     show_vol=True,
 )
 
@@ -784,10 +781,10 @@ def build_text_message():
         "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
     )
     lines += format_picks(
-        "正式策略3 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 弱市40% + TOP800 + 持有5天）",
+        "正式策略3 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 无弱市 + TOP800 + 持有5天）",
         picks_a,
         STRATEGY_METRICS.get('StrategyA', '⚠️ 回测指标待更新'),
-        "T+1开盘买 | 止损3.5%止盈4.0% | 持有5天了结",
+        "T+1开盘买 | 止损3.5%/止盈4.0% | 最多5天（用户自执行SL/TP）",
         show_vol=True,
     )
     lines.append(f"数据：{latest} | 正式策略3只 | 不构成投资建议")
