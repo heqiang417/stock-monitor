@@ -695,12 +695,115 @@ def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False):
         {"tag": "hr"},
     ]
 
+
+def build_action_advice(picks_a, picks_kdj, picks_b1):
+    """生成卡片/文本统一使用的操作建议与Top榜"""
+    strategy_order = {'StrategyA': 0, 'BB1.02_KDJ': 1, 'BB1.00': 2}
+    by_symbol = {}
+
+    for strategy, picks in [('StrategyA', picks_a), ('BB1.02_KDJ', picks_kdj), ('BB1.00', picks_b1)]:
+        for p in picks:
+            sym = p[0]
+            rec = by_symbol.setdefault(sym, {
+                'symbol': sym,
+                'name': stock_name(sym),
+                'strategies': [],
+                'close': p[1],
+                'rsi': p[2],
+                'vol_ratio': p[4] if strategy == 'StrategyA' else 0,
+                'fund_score': p[-1] if len(p) >= 6 else 0,
+                'score': 0.0,
+                'reason_bits': [],
+            })
+            rec['strategies'].append(strategy)
+            rec['rsi'] = min(rec['rsi'], p[2])
+            if strategy == 'StrategyA' and len(p) >= 5:
+                rec['vol_ratio'] = max(rec['vol_ratio'], p[4])
+            if len(p) >= 6:
+                rec['fund_score'] = max(rec['fund_score'], p[5])
+
+    ranked = []
+    for rec in by_symbol.values():
+        strategies = sorted(rec['strategies'], key=lambda s: strategy_order[s])
+        score = 0.0
+        reason_bits = []
+
+        if len(strategies) >= 2:
+            score += 120
+            reason_bits.append('多策略共振')
+        if 'StrategyA' in strategies:
+            score += 100
+            reason_bits.append('命中策略A')
+        elif 'BB1.02_KDJ' in strategies:
+            score += 70
+            reason_bits.append('命中BB1.02+KDJ')
+        else:
+            score += 40
+            reason_bits.append('命中BB1.00')
+
+        score += max(0, 25 - rec['rsi']) * 2
+        if rec['vol_ratio'] > 0:
+            score += (rec['vol_ratio'] - 1.0) * 20
+            reason_bits.append(f"放量{rec['vol_ratio']:.1f}x")
+        reason_bits.append(f"RSI{rec['rsi']:.1f}")
+
+        rec['score'] = round(score, 1)
+        rec['reason_bits'] = reason_bits
+        ranked.append(rec)
+
+    ranked.sort(key=lambda x: (-x['score'], x['rsi'], -x['vol_ratio'], strategy_order.get(sorted(x['strategies'], key=lambda s: strategy_order[s])[0], 99)))
+
+    total_unique = len(ranked)
+    resonance_count = sum(1 for x in ranked if len(x['strategies']) >= 2)
+    total_picks = len(picks_a) + len(picks_kdj) + len(picks_b1)
+
+    if total_unique == 0:
+        summary = '无明显强票，宁可空仓，不建议为凑单强行买入'
+        focus = '今日无候选，等待下一交易日'
+        position = '建议持仓：0只'
+        risk = '若强行做，只会放大噪音'
+    else:
+        focus_n = 2 if total_unique >= 2 else 1
+        summary = f"建议优先看前{min(3, total_unique)}只；共振票{resonance_count}只；优先级：策略A > BB1.02+KDJ > BB1.00"
+        focus = f"优先关注：Top{focus_n}{'（先看策略A/共振票）' if any('StrategyA' in x['strategies'] for x in ranked[:focus_n]) else ''}"
+        position = f"建议持仓：不超过{min(3, total_unique)}只"
+        risk = '开盘接近涨停 / 流动性差 / 有明显利空则跳过'
+        if total_picks >= 6:
+            risk = '候选偏多，只拿前2~3只，别平均分散'
+        elif resonance_count == 0:
+            risk = '今日无共振票，优先看策略A前排，降低预期'
+
+    top_lines = []
+    for idx, rec in enumerate(ranked[:3], 1):
+        strategy_label = '+'.join(rec['strategies'])
+        reason = ' / '.join(rec['reason_bits'][:3])
+        top_lines.append(f"Top{idx}：**{rec['name']}**({rec['symbol'][-6:]})｜{strategy_label}｜{reason}")
+
+    return {
+        'summary': summary,
+        'focus': focus,
+        'position': position,
+        'risk': risk,
+        'top_lines': top_lines,
+        'ranked': ranked,
+    }
+
+
+action_advice = build_action_advice(picks_a, picks_kdj, picks_b1)
+
 elements = [
     {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 正式策略池**"}},
     {"tag": "hr"},
     {"tag": "div", "text": {"tag": "lark_md", "content": f"🟢 大盘弱市 {weak_pct:.1f}%（需50%:{'✅' if market_ok_50 else '❌'} | 需70%:{'✅' if market_ok_70 else '❌'}）"}},
     {"tag": "hr"},
+    {"tag": "div", "text": {"tag": "lark_md", "content": "**📌 今日操作建议**"}},
+    {"tag": "div", "text": {"tag": "lark_md", "content": f"- {action_advice['summary']}\n- {action_advice['focus']}\n- {action_advice['position']}\n- 风险提醒：{action_advice['risk']}"}},
 ]
+
+if action_advice['top_lines']:
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(action_advice['top_lines'])}})
+
+elements.append({"tag": "hr"})
 
 # BB1.00 - 动态读取评估结果
 bb100_metric = STRATEGY_METRICS.get('BB1.00', '⚠️ 回测指标待更新')
@@ -787,6 +890,19 @@ def build_text_message():
         "T+1开盘买 | 止损3.5%/止盈4.0% | 最多5天（用户自执行SL/TP）",
         show_vol=True,
     )
+
+    # 操作建议
+    lines.append("")
+    lines.append(f"📌 今日操作建议")
+    lines.append(f"- {action_advice['summary']}")
+    lines.append(f"- {action_advice['focus']}")
+    lines.append(f"- {action_advice['position']}")
+    lines.append(f"- 风险提醒：{action_advice['risk']}")
+    if action_advice['top_lines']:
+        for t in action_advice['top_lines']:
+            lines.append(f"  {t}")
+
+    lines.append("")
     lines.append(f"数据：{latest} | 正式策略3只 | 不构成投资建议")
     return "\n".join(lines)
 
