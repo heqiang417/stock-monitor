@@ -36,14 +36,24 @@
 
 ## L3 系统深处
 
+### 架构文档
+| 文档 | 内容 |
+|------|------|
+| [routes.md](deep_dive/routes.md) | Flask 路由层 |
+| [services.md](deep_dive/services.md) | 业务服务层 |
+| [data_provider.md](deep_dive/data_provider.md) | 多数据源架构 |
+| [models.md](deep_dive/models.md) | 数据模型 |
+| [utils.md](deep_dive/utils.md) | 工具函数 |
+| [db.md](deep_dive/db.md) | 数据库连接池 |
+| [app.md](deep_dive/app.md) | Flask 主入口 |
+| [tests.md](deep_dive/tests.md) | 测试套件 |
+
+### 参考文档
 | 文档 | 内容 |
 |------|------|
 | [database_schema.md](deep_dive/database_schema.md) | 数据库结构 |
-| [data_provider.md](deep_dive/data_provider.md) | 数据源 |
-| [routes.md](deep_dive/routes.md) | 路由 |
-| [services.md](deep_dive/services.md) | 服务层 |
-| [models.md](deep_dive/models.md) | 数据模型 |
-| [tests.md](deep_dive/tests.md) | 测试 |
+| [CODE_REVIEW.md](deep_dive/CODE_REVIEW.md) | Code Review 报告 |
+| [api_logs.md](deep_dive/api_logs.md) | API 日志与排障 |
 
 ---
 
@@ -74,7 +84,15 @@
 ├── DEPLOY.md (L3) ─────────────────────→ 部署
 │
 └── deep_dive/ (L3) ───────────────────→ 系统深处
+    ├── routes.md              — Flask 路由层
+    ├── services.md            — 业务服务层
+    ├── data_provider.md       — 多数据源架构
+    ├── models.md              — 数据模型
+    ├── utils.md               — 工具函数
+    ├── db.md                  — 数据库连接池
+    ├── app.md                 — Flask 主入口
+    ├── tests.md               — 测试套件
     ├── database_schema.md
-    ├── data_provider.md
-    └── ...
+    ├── CODE_REVIEW.md
+    └── api_logs.md
 ```
