@@ -6,6 +6,7 @@
   1. BB1.00：RSI<20 + BB<=1.00 + 弱市70% + 7天持有
   2. BB1.02+KDJ Oversold：RSI<20 + BB<=1.02 + KDJ超卖 + 弱市70% + TOP500
   3. 策略A（新）：RSI<19 + BB<=1.00 + 放量1.1x + 无弱市过滤 + TOP800 + 止损3.5%/止盈4.0% + 持有5天
+  4. 策略E（TP4.5）：RSI<20 + BB<=1.00 + 放量1.1x + 弱市40% + TOP800 + 止损3.5%/止盈4.5% + 持有5天
 
 Fstop3_pt5 v10：已降级为历史/对照策略，不再纳入正式每日策略池。
 
@@ -111,6 +112,13 @@ def load_strategy_metrics():
         f"测试143笔 | 回测含SL/TP，实盘需用户自执行"
     )
 
+    # 策略E（TP4.5：RSI20 + BB1.00 + VOL1.1 + weak0.4 + TOP800 + SL3.5/TP4.5 + H5）
+    metrics['StrategyE_TP45'] = (
+        f"三阶段胜率 55.2%/75.2%/66.7% | "
+        f"夏普 1.31/7.00/2.94 | "
+        f"测试162笔 | 回测含SL/TP，实盘需用户自执行"
+    )
+
     return metrics
 
 def load_strategy_qualified():
@@ -150,6 +158,9 @@ def load_strategy_qualified():
     # 策略A：direction7 精修结果已确认三阶段全合格，直接硬编码 True
     q['StrategyA'] = True
 
+    # 策略E（TP4.5）：全面效果最强候选，已确认三阶段全合格，直接纳入正式池
+    q['StrategyE_TP45'] = True
+
     return q
 
 STRATEGY_METRICS = load_strategy_metrics()
@@ -172,7 +183,7 @@ DAILY_SYNC = os.path.join(SCRIPT_DIR, 'daily_sync.py')
 TODAY = datetime.now().strftime('%Y-%m-%d')
 MIN_STOCKS = 4000
 VALID_LOOKBACK_DAYS = 10
-STRATEGY_VERSION = "combined-v1.2"
+STRATEGY_VERSION = "combined-v1.3"
 
 db = sqlite3.connect(DB_PATH)
 db.execute('PRAGMA journal_mode=WAL')
@@ -205,9 +216,35 @@ if args.wait and not args.date:
             pass
 
         if ready_date:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据就绪: {ready_date}")
-            latest = ready_date
-            break
+            # ── 关键修复：校验 READY_FLAG 里的日期是否真的有效 ──
+            # 1. 日期不能太老（超过 2 个交易日就认为失效）
+            import re
+            is_valid_format = bool(re.match(r'^\d{4}-\d{2}-\d{2}$', ready_date))
+            is_recent = False
+            if is_valid_format:
+                try:
+                    rd = datetime.strptime(ready_date, '%Y-%m-%d').date()
+                    diff = (datetime.now().date() - rd).days
+                    is_recent = diff <= 2
+                except Exception:
+                    pass
+
+            # 2. 日期必须今天或昨天（交易日范围内）
+            if is_valid_format and is_recent:
+                # 二次验证：确认数据库里这个日期真的有足够数据
+                row = db.execute(
+                    "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?",
+                    (ready_date,)
+                ).fetchone()
+                kline_count = row[0] if row else 0
+                if kline_count >= MIN_STOCKS:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据就绪: {ready_date} ({kline_count}只)")
+                    latest = ready_date
+                    break
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] READY_FLAG日期{ready_date}数据不足({kline_count}只)，继续等待... ({waited}s)")
+            elif ready_date:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] READY_FLAG日期{ready_date}已过期或无效，继续等待... ({waited}s)")
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 等待数据... ({waited}s)")
         time.sleep(60)
@@ -227,7 +264,7 @@ if args.wait and not args.date:
     db = sqlite3.connect(DB_PATH)
     db.execute('PRAGMA journal_mode=WAL')
 
-# 若未指定日期且今天数据不足，自动回退到最近有效交易日
+# 若未指定日期且当前 latest 数据不足，自动回退到最近有效交易日
 if not args.date:
     latest_total = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest,)).fetchone()[0]
     if latest_total < MIN_STOCKS:
@@ -621,6 +658,56 @@ else:
     picks_a = []
     print("策略未通过门槛，已跳过")
 
+# === 正式策略4: 策略E（TP4.5：RSI20 + BB1.00 + VOL1.1 + 弱市40% + TOP800 + SL3.5/TP4.5 + H5）===
+print(f"\n=== 策略E（TP4.5，RSI20+BB1.00+VOL1.1+弱市40%+TOP800）===")
+print(f"大盘弱市 {weak_pct:.1f}%（需40%:{'✅' if weak_pct >= 40 else '❌'}）")
+if STRATEGY_QUALIFIED.get('StrategyE_TP45', False):
+    top800_syms_e = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:800]}
+    placeholders_e = ','.join(f'"{s}"' for s in top800_syms_e)
+    cond_sql_e = (
+        f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL "
+        f"AND close <= boll_lower * 1.0 AND symbol IN ({placeholders_e})"
+    )
+    candidates_e = db.execute(f"""
+        SELECT symbol, close, rsi14, boll_lower FROM kline_daily
+        WHERE trade_date='{latest}' AND {cond_sql_e}
+        ORDER BY rsi14 ASC
+    """).fetchall()
+
+    picks_e = []
+    if weak_pct >= 40:
+        for sym, close, rsi, bb in candidates_e:
+            vr = vol_ratio(sym)
+            if vr >= 1.1:
+                picks_e.append((sym, close, rsi, bb, vr, fund.get(sym, 0)))
+    picks_e.sort(key=lambda x: x[2])
+    picks_e = picks_e[:20]
+    print(f"候选: {len(picks_e)} 只")
+    for p in picks_e:
+        print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f} 放量{p[4]:.2f}x")
+else:
+    picks_e = []
+    print("策略未通过门槛，已跳过")
+
+STRATEGY_EXECUTION_RULES = {
+    'BB1.00': {
+        'buy': '信号日次一交易日开盘买入；若开盘接近涨停、明显一字板、流动性过差或突发利空，则跳过。',
+        'sell': '固定持有7个交易日，于第8个交易日收盘卖出；不设止损止盈。',
+    },
+    'BB1.02_KDJ': {
+        'buy': '信号日次一交易日开盘买入；若开盘接近涨停、明显高开失真、流动性过差或突发利空，则跳过。',
+        'sell': '固定持有7个交易日，于第8个交易日收盘卖出；不设止损止盈。',
+    },
+    'StrategyA': {
+        'buy': '信号日次一交易日开盘买入；仅适合按纪律执行止损止盈，若无法盯盘或无法执行纪律则放弃。',
+        'sell': 'T+2起按收盘检查止损-3.5%或止盈+4.0%；若5个交易日内均未触发，则第6个交易日收盘卖出。',
+    },
+    'StrategyE_TP45': {
+        'buy': '信号日次一交易日开盘买入；仅在弱市≥40%触发当日信号时参与，且需能严格执行止损止盈。',
+        'sell': 'T+2起按收盘检查止损-3.5%或止盈+4.5%；若5个交易日内均未触发，则第6个交易日收盘卖出。',
+    },
+}
+
 # === 历史记录 ===
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'reports', 'daily_picks')
 os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -632,9 +719,26 @@ result_record = {
         "stale_trade_days": stale_trade_days or 0
     },
     "strategies": {
-        "BB1.00": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b1]},
-        "BB1.02_KDJ": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_kdj]},
-        "StrategyA": {"picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_a]},
+        "BB1.00": {
+            "buy_rule": STRATEGY_EXECUTION_RULES['BB1.00']['buy'],
+            "sell_rule": STRATEGY_EXECUTION_RULES['BB1.00']['sell'],
+            "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b1]
+        },
+        "BB1.02_KDJ": {
+            "buy_rule": STRATEGY_EXECUTION_RULES['BB1.02_KDJ']['buy'],
+            "sell_rule": STRATEGY_EXECUTION_RULES['BB1.02_KDJ']['sell'],
+            "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_kdj]
+        },
+        "StrategyA": {
+            "buy_rule": STRATEGY_EXECUTION_RULES['StrategyA']['buy'],
+            "sell_rule": STRATEGY_EXECUTION_RULES['StrategyA']['sell'],
+            "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_a]
+        },
+        "StrategyE_TP45": {
+            "buy_rule": STRATEGY_EXECUTION_RULES['StrategyE_TP45']['buy'],
+            "sell_rule": STRATEGY_EXECUTION_RULES['StrategyE_TP45']['sell'],
+            "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_e]
+        },
     },
     "reference_strategies": {
         "Fstop3_pt5_v10": {
@@ -672,7 +776,7 @@ except:
 def stock_name(sym):
     return stock_names.get(sym, sym)
 
-def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False):
+def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False, strategy_key=None):
     """构建单个策略的卡片区域"""
     if picks:
         lines = []
@@ -687,21 +791,32 @@ def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False):
     else:
         items_md = "无候选"
         count_md = "0只"
+
+    rules = STRATEGY_EXECUTION_RULES.get(strategy_key or '', {})
+    buy_md = rules.get('buy', '')
+    sell_md = rules.get('sell', '')
+    extra_blocks = []
+    if buy_md:
+        extra_blocks.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**买入策略**：{buy_md}"}})
+    if sell_md:
+        extra_blocks.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**卖出策略**：{sell_md}"}})
+
     return [
         {"tag": "div", "text": {"tag": "lark_md", "content": f"**{title}** {count_md}"}},
         {"tag": "div", "text": {"tag": "lark_md", "content": items_md}},
         {"tag": "div", "text": {"tag": "lark_md", "content": cond_md}},
         {"tag": "div", "text": {"tag": "lark_md", "content": note_md}},
+        *extra_blocks,
         {"tag": "hr"},
     ]
 
 
-def build_action_advice(picks_a, picks_kdj, picks_b1):
+def build_action_advice(picks_e, picks_a, picks_kdj, picks_b1):
     """生成卡片/文本统一使用的操作建议与Top榜"""
-    strategy_order = {'StrategyA': 0, 'BB1.02_KDJ': 1, 'BB1.00': 2}
+    strategy_order = {'StrategyE_TP45': 0, 'StrategyA': 1, 'BB1.02_KDJ': 2, 'BB1.00': 3}
     by_symbol = {}
 
-    for strategy, picks in [('StrategyA', picks_a), ('BB1.02_KDJ', picks_kdj), ('BB1.00', picks_b1)]:
+    for strategy, picks in [('StrategyE_TP45', picks_e), ('StrategyA', picks_a), ('BB1.02_KDJ', picks_kdj), ('BB1.00', picks_b1)]:
         for p in picks:
             sym = p[0]
             rec = by_symbol.setdefault(sym, {
@@ -710,14 +825,14 @@ def build_action_advice(picks_a, picks_kdj, picks_b1):
                 'strategies': [],
                 'close': p[1],
                 'rsi': p[2],
-                'vol_ratio': p[4] if strategy == 'StrategyA' else 0,
+                'vol_ratio': p[4] if strategy in ('StrategyA', 'StrategyE_TP45') else 0,
                 'fund_score': p[-1] if len(p) >= 6 else 0,
                 'score': 0.0,
                 'reason_bits': [],
             })
             rec['strategies'].append(strategy)
             rec['rsi'] = min(rec['rsi'], p[2])
-            if strategy == 'StrategyA' and len(p) >= 5:
+            if strategy in ('StrategyA', 'StrategyE_TP45') and len(p) >= 5:
                 rec['vol_ratio'] = max(rec['vol_ratio'], p[4])
             if len(p) >= 6:
                 rec['fund_score'] = max(rec['fund_score'], p[5])
@@ -731,7 +846,10 @@ def build_action_advice(picks_a, picks_kdj, picks_b1):
         if len(strategies) >= 2:
             score += 120
             reason_bits.append('多策略共振')
-        if 'StrategyA' in strategies:
+        if 'StrategyE_TP45' in strategies:
+            score += 120
+            reason_bits.append('命中TP4.5')
+        elif 'StrategyA' in strategies:
             score += 100
             reason_bits.append('命中策略A')
         elif 'BB1.02_KDJ' in strategies:
@@ -764,14 +882,14 @@ def build_action_advice(picks_a, picks_kdj, picks_b1):
         risk = '若强行做，只会放大噪音'
     else:
         focus_n = 2 if total_unique >= 2 else 1
-        summary = f"建议优先看前{min(3, total_unique)}只；共振票{resonance_count}只；优先级：策略A > BB1.02+KDJ > BB1.00"
-        focus = f"优先关注：Top{focus_n}{'（先看策略A/共振票）' if any('StrategyA' in x['strategies'] for x in ranked[:focus_n]) else ''}"
+        summary = f"建议优先看前{min(3, total_unique)}只；共振票{resonance_count}只；优先级：TP4.5 > 策略A > BB1.02+KDJ > BB1.00"
+        focus = f"优先关注：Top{focus_n}{'（先看TP4.5/策略A/共振票）' if any(('StrategyE_TP45' in x['strategies'] or 'StrategyA' in x['strategies']) for x in ranked[:focus_n]) else ''}"
         position = f"建议持仓：不超过{min(3, total_unique)}只"
         risk = '开盘接近涨停 / 流动性差 / 有明显利空则跳过'
         if total_picks >= 6:
             risk = '候选偏多，只拿前2~3只，别平均分散'
         elif resonance_count == 0:
-            risk = '今日无共振票，优先看策略A前排，降低预期'
+            risk = '今日无共振票，优先看TP4.5/策略A前排，降低预期'
 
     top_lines = []
     for idx, rec in enumerate(ranked[:3], 1):
@@ -789,7 +907,7 @@ def build_action_advice(picks_a, picks_kdj, picks_b1):
     }
 
 
-action_advice = build_action_advice(picks_a, picks_kdj, picks_b1)
+action_advice = build_action_advice(picks_e, picks_a, picks_kdj, picks_b1)
 
 elements = [
     {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 正式策略池**"}},
@@ -811,7 +929,8 @@ elements += build_section(
     title="正式策略1️⃣ BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
     picks=picks_b1,
     cond_md=f"回测：{bb100_metric}",
-    note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
+    note_md="摘要：固定持有型；适合不做盘中止损止盈的执行方式。",
+    strategy_key='BB1.00',
 )
 # BB1.02+KDJ - 动态读取评估结果
 bbkdj_metric = STRATEGY_METRICS.get('BB1.02_KDJ', '⚠️ 回测指标待更新')
@@ -819,7 +938,8 @@ elements += build_section(
     title="正式策略2️⃣ BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
     picks=picks_kdj,
     cond_md=f"回测：{bbkdj_metric}",
-    note_md="建议：T+1开盘买 | 持有7天次日卖出 | 不设止损止盈",
+    note_md="摘要：固定持有型；强调KDJ超卖确认，不做盘中止损止盈。",
+    strategy_key='BB1.02_KDJ',
 )
 # 策略A - 动态读取评估结果
 strategy_a_metric = STRATEGY_METRICS.get('StrategyA', '⚠️ 回测指标待更新')
@@ -827,12 +947,23 @@ elements += build_section(
     title="正式策略3️⃣ 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 无弱市 + TOP800 + 持有5天）",
     picks=picks_a,
     cond_md=f"回测：{strategy_a_metric}",
-    note_md="建议：T+1开盘买 | 止损3.5% / 止盈4.0% | 最多持有5天（用户需自执行SL/TP）",
+    note_md="摘要：纪律型止盈止损策略；信号更频繁，但要求执行更强。",
     show_vol=True,
+    strategy_key='StrategyA',
+)
+# 策略E（TP4.5）- 动态读取评估结果
+tp45_metric = STRATEGY_METRICS.get('StrategyE_TP45', '⚠️ 回测指标待更新')
+elements += build_section(
+    title="正式策略4️⃣ TP4.5（RSI<20 + BB≤1.00 + 放量1.1x + 弱市40% + TOP800 + 持有5天）",
+    picks=picks_e,
+    cond_md=f"回测：{tp45_metric}",
+    note_md="摘要：进攻型止盈止损策略；仅在轻弱市触发时参与。",
+    show_vol=True,
+    strategy_key='StrategyE_TP45',
 )
 
 
-elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 正式策略3只 | 不构成投资建议"}]})
+elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 正式策略4只 | 不构成投资建议"}]})
 
 card = {
     "config": {"wide_screen_mode": True},
@@ -857,7 +988,7 @@ def build_text_message():
     lines.append(f"大盘弱市 {weak_pct:.1f}%（需50%:{'✅' if market_ok_50 else '❌'} | 需70%:{'✅' if market_ok_70 else '❌'}）")
     lines.append("")
 
-    def format_picks(title, picks, cond, note, show_vol=False, max_show=5):
+    def format_picks(title, picks, cond, note, show_vol=False, max_show=5, strategy_key=None):
         out = []
         out.append(f"【{title}】共{len(picks)}只")
         if picks:
@@ -867,7 +998,12 @@ def build_text_message():
         else:
             out.append("  无候选")
         out.append(f"  回测：{cond}")
-        out.append(f"  {note}")
+        out.append(f"  摘要：{note}")
+        rules = STRATEGY_EXECUTION_RULES.get(strategy_key or '', {})
+        if rules.get('buy'):
+            out.append(f"  买入策略：{rules['buy']}")
+        if rules.get('sell'):
+            out.append(f"  卖出策略：{rules['sell']}")
         out.append("")
         return out
 
@@ -875,23 +1011,33 @@ def build_text_message():
         "正式策略1 BB1.00（RSI<20 + BB≤1.00 + 弱市70% + 7天持有）",
         picks_b1,
         STRATEGY_METRICS.get('BB1.00', '⚠️ 回测指标待更新'),
-        "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
+        "固定持有型；适合不做盘中止损止盈的执行方式。",
+        strategy_key='BB1.00'
     )
     lines += format_picks(
         "正式策略2 BB1.02+KDJ（RSI<20 + BB≤1.02 + KDJ超卖 + 弱市70% + TOP500）",
         picks_kdj,
         STRATEGY_METRICS.get('BB1.02_KDJ', '⚠️ 回测指标待更新'),
-        "T+1开盘买 | 持有7天次日卖出 | 不设止损止盈"
+        "固定持有型；强调KDJ超卖确认，不做盘中止损止盈。",
+        strategy_key='BB1.02_KDJ'
     )
     lines += format_picks(
         "正式策略3 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 无弱市 + TOP800 + 持有5天）",
         picks_a,
         STRATEGY_METRICS.get('StrategyA', '⚠️ 回测指标待更新'),
-        "T+1开盘买 | 止损3.5%/止盈4.0% | 最多5天（用户自执行SL/TP）",
+        "纪律型止盈止损策略；信号更频繁，但要求执行更强。",
         show_vol=True,
+        strategy_key='StrategyA',
+    )
+    lines += format_picks(
+        "正式策略4 TP4.5（RSI<20 + BB≤1.00 + 放量1.1x + 弱市40% + TOP800 + 持有5天）",
+        picks_e,
+        STRATEGY_METRICS.get('StrategyE_TP45', '⚠️ 回测指标待更新'),
+        "进攻型止盈止损策略；仅在轻弱市触发时参与。",
+        show_vol=True,
+        strategy_key='StrategyE_TP45',
     )
 
-    # 操作建议
     lines.append("")
     lines.append(f"📌 今日操作建议")
     lines.append(f"- {action_advice['summary']}")
@@ -903,7 +1049,7 @@ def build_text_message():
             lines.append(f"  {t}")
 
     lines.append("")
-    lines.append(f"数据：{latest} | 正式策略3只 | 不构成投资建议")
+    lines.append(f"数据：{latest} | 正式策略4只 | 不构成投资建议")
     return "\n".join(lines)
 
 text_msg = build_text_message()
