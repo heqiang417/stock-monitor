@@ -16,6 +16,7 @@
   ev.print_28_metrics(result)
   ev.save(result, 'my_strategy')
 """
+import calendar
 import sqlite3, json, time, os
 import numpy as np
 from datetime import datetime, timedelta
@@ -31,10 +32,30 @@ RF = 0.03          # 无风险利率 3%
 COST = 0.30        # 0.15%单边 x2
 OUTPUT_DIR = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results'
 
+def _get_latest_db_date() -> str:
+    """从数据库动态获取最近交易日（不包含今天，避免T日数据不完整）"""
+    try:
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("SELECT MAX(trade_date) FROM kline_daily")
+        latest = c.fetchone()[0]
+        conn.close()
+        if latest:
+            # 取昨天作为截止（确保T日K线已完整）
+            from datetime import date
+            d = datetime.strptime(latest, '%Y-%m-%d').date()
+            yesterday = (d - timedelta(days=1)).strftime('%Y-%m-%d')
+            return yesterday
+    except Exception:
+        pass
+    return '2026-03-27'  # 回退默认值
+
+_LATEST_DATE = _get_latest_db_date()
+
 PHASES = {
     'train': ('2021-01-01', '2024-06-30'),
     'val':   ('2024-07-01', '2025-07-01'),
-    'test':  ('2025-07-02', '2026-03-27'),
+    'test':  ('2025-07-02', _LATEST_DATE),
 }
 
 # ============================================================
@@ -499,8 +520,10 @@ class StrategyEvaluator:
 
             while dt <= end_dt:
                 ms = dt.strftime('%Y-%m-%d')
-                me_dt = dt + timedelta(days=32)
-                me = min(me_dt.replace(day=1).strftime('%Y-%m-%d'), pe)
+                # 正确计算月末：使用 calendar.monthrange 避免 days=32 跨月跳俩月的 bug
+                _, last_day = calendar.monthrange(dt.year, dt.month)
+                me_dt = dt.replace(day=last_day)
+                me = min(me_dt.strftime('%Y-%m-%d'), pe)
 
                 top_stocks = monthly.get(ms, [])
                 # 收集每天的信号（支持 top_n_per_day 筛选）

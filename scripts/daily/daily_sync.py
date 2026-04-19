@@ -60,6 +60,16 @@ from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.tushare_fetcher import TushareFetcher
 from data_provider.baostock_fetcher import BaostockFetcher
 
+# akshare 内部请求会被系统代理(clash)阻断，在 import 前清除代理环境变量
+def _clear_proxy():
+    for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+        os.environ.pop(k, None)
+    try:
+        import requests
+        requests.session().trust_env = False
+    except Exception:
+        pass
+
 # 初始化多数据源管理器（腾讯最稳定，优先）
 _manager = DataFetcherManager()
 _manager.register(TencentFetcher(priority=0))
@@ -414,125 +424,74 @@ def sync_monthly_kline():
 # ============================================================
 def sync_valuation():
     log("=== 同步估值数据 ===")
+    # 优先走腾讯实时估值兜底，避免 akshare/eastmoney push2 断连
     try:
-        import akshare as ak
-    except ImportError:
-        log("  akshare 未安装，跳过")
-        return
-
-    conn = connect_db()
-    try:
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and not df.empty:
-            count = 0
-            for _, row in df.iterrows():
-                code = str(row.get('代码', ''))
-                if code.startswith('6'):
-                    symbol = f'sh{code}'
-                elif code.startswith(('0', '3')):
-                    symbol = f'sz{code}'
-                else:
-                    continue
-
-                pe = row.get('市盈率-动态')
-                pb = row.get('市净率')
-                ps = row.get('市销率')
-
-                conn.execute('''INSERT OR REPLACE INTO daily_valuation
-                    (symbol, trade_date, pe_ttm, pb, ps_ttm) VALUES (?,?,?,?,?)''',
-                    (symbol, today, float(pe) if pe and pe != '-' else None,
-                     float(pb) if pb and pb != '-' else None,
-                     float(ps) if ps and ps != '-' else None))
-                count += 1
-
-            conn.commit()
-            log(f"  估值数据完成: 更新{count}只")
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     except Exception as e:
-        log(f"  估值数据失败: {e}")
-    finally:
-        conn.close()
-
-# ============================================================
-# 7. 资金流向更新
-# ============================================================
-def sync_capital_flow():
-    """资金流向全量同步：并发获取所有历史记录，批量写入，速度快"""
-    log("=== 同步资金流向（全量批量）===")
-    try:
-        import akshare as ak
-    except ImportError:
-        log("  akshare 未安装，跳过")
+        log(f"  requests 不可用，跳过: {e}")
         return
 
     conn = connect_db()
     symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
-    conn.close()
 
-    BATCH = 500  # 每500只写一次DB
-    all_rows = []  # 收集所有待写入记录
-    db_lock = threading.Lock()
-    done_count = [0]  # 用列表方便在内层修改
+    def _get_session():
+        s = requests.Session()
+        s.trust_env = False
+        s.proxies = {"http": "", "https": ""}
+        return s
 
-    def fetch_all_history(symbol):
-        """获取该股全部历史资金流向，返回多条记录"""
-        code = symbol[2:]
-        market = 'sh' if symbol.startswith('sh') else 'sz'
+    def _fetch_tencent_quote(symbol):
+        session = _get_session()
         try:
-            df = ak.stock_individual_fund_flow(stock=code, market=market)
-            if df is None or df.empty:
-                return []
-            rows = []
-            for _, row in df.iterrows():
-                rows.append((
-                    symbol,
-                    str(row.get('日期', '')),
-                    float(row.get('主力净流入-净额', 0) or 0) / 10000.0,
-                    float(row.get('超大单净流入-净额', 0) or 0) / 10000.0,
-                    float(row.get('大单净流入-净额', 0) or 0) / 10000.0,
-                    float(row.get('中单净流入-净额', 0) or 0) / 10000.0,
-                    float(row.get('小单净流入-净额', 0) or 0) / 10000.0,
-                ))
-            return rows
-        except:
-            return []
+            r = session.get(
+                f'https://203.205.235.28/q={symbol}',
+                headers={'Host': 'qt.gtimg.cn'},
+                verify=False,
+                timeout=15,
+            )
+            text = r.text.strip()
+            eq_pos = text.index('=')
+            fields = text[eq_pos + 2:-1].split('~')
+            if len(fields) >= 47:
+                return {
+                    'pe': float(fields[39]) if fields[39] else None,
+                    'pb': float(fields[46]) if fields[46] else None,
+                }
+        except Exception:
+            return None
+        return None
 
-    def write_batch(rows):
-        if not rows:
-            return
-        conn = connect_db()
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=NORMAL')
-        conn.executemany('''INSERT OR REPLACE INTO capital_flow
-            (symbol, trade_date, main_net_inflow, super_large_net_inflow,
-             large_net_inflow, medium_net_inflow, small_net_inflow)
-            VALUES (?,?,?,?,?,?,?)''', rows)
-        conn.commit()
-        conn.close()
-
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(fetch_all_history, s): s for s in symbols}
-        batch = []
-        for f in as_completed(futures):
+    count = 0
+    failed = 0
+    for i, symbol in enumerate(symbols):
+        quote = _fetch_tencent_quote(symbol)
+        if quote and (quote.get('pe') is not None or quote.get('pb') is not None):
             try:
-                rows = f.result(timeout=15)
-            except:
-                rows = []
-            if rows:
-                batch.extend(rows)
-            done_count[0] += 1
-            if done_count[0] % 500 == 0:
-                log(f"  资金流向进度: {done_count[0]}/{len(symbols)}")
-            # 凑够BATCH条就写入
-            if len(batch) >= BATCH:
-                with db_lock:
-                    write_batch(batch)
-                batch = []
-        # 剩余的写完
-        if batch:
-            with db_lock:
-                write_batch(batch)
+                conn.execute('''INSERT OR REPLACE INTO daily_valuation
+                    (symbol, trade_date, pe_ttm, pb, ps_ttm) VALUES (?,?,?,?,?)''',
+                    (symbol, today, quote.get('pe'), quote.get('pb'), None))
+                count += 1
+            except Exception:
+                failed += 1
+        else:
+            failed += 1
+        if (i + 1) % 1000 == 0:
+            log(f"  估值进度: {i+1}/{len(symbols)}")
 
-    log(f"  资金流向完成: 处理{done_count[0]}只")
+    conn.commit()
+    conn.close()
+    log(f"  估值数据完成: 更新{count}只, 失败{failed}只")
+
+# ============================================================
+# 7. 资金流向更新（当前 eastmoney push2 不稳，先降级为跳过+明确日志）
+# ============================================================
+def sync_capital_flow():
+    """资金流向当前数据源不稳定，先止血：不再长时间卡死或写入异常稀疏数据。"""
+    log("=== 同步资金流向（降级保护）===")
+    log("  ⚠️ 当前 eastmoney push2 链路不稳定，资金流同步暂时跳过，保留历史数据")
+    log("  ⚠️ 待切换稳定替代数据源后再恢复日更")
 
 # ============================================================
 # 8. 行业板块更新
@@ -609,6 +568,7 @@ def sync_northbound_flow():
         log("  akshare 未安装，跳过")
         return
 
+    _clear_proxy()
     conn = connect_db()
     # 检查已有最新日期
     latest = conn.execute("SELECT MAX(date) FROM northbound_flow").fetchone()[0]
@@ -654,6 +614,7 @@ def sync_margin_data():
         log("  akshare 未安装，跳过")
         return
 
+    _clear_proxy()
     conn = connect_db()
     latest = conn.execute("SELECT MAX(date) FROM margin_data").fetchone()[0]
     conn.close()
@@ -682,6 +643,8 @@ def sync_margin_data():
         for attempt in range(3):
             try:
                 df = ak.stock_margin_detail_sse(date=date_str)
+                # akshare 在无数据时返回 0行df但尝试设置13列名，报 ValueError
+                # 将其视为"无数据"而非失败
                 if df is None or df.empty:
                     log(f"  融资融券 {date_str} 无数据，跳过")
                     success_for_day = True
@@ -712,6 +675,14 @@ def sync_margin_data():
                 count += 1
                 success_for_day = True
                 break
+            except ValueError as ve:
+                # akshare 返回空df时设置列名失败，视为"无数据"而非失败
+                if 'Length mismatch' in str(ve):
+                    log(f"  融资融券 {date_str} 无数据（接口返回空），跳过")
+                    success_for_day = True
+                    break
+                last_err = ve
+                time.sleep(1 + attempt)
             except Exception as e:
                 last_err = e
                 time.sleep(1 + attempt)
