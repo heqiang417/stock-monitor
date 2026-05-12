@@ -25,6 +25,8 @@ if SCRIPT_DIR not in sys.path:
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from configs.strategy_loader import load_all_strategies, load_strategy
+
 from sync_health import (
     assess_trade_date_health,
     find_best_trade_date,
@@ -213,8 +215,12 @@ DAILY_SYNC = os.path.join(SCRIPT_DIR, 'daily_sync.py')
 TODAY = datetime.now().strftime('%Y-%m-%d')
 MIN_STOCKS = 3000
 VALID_LOOKBACK_DAYS = 10
-STRATEGY_VERSION = "combined-v1.3"
+STRATEGY_VERSION = "combined-v1.4"
 REQUIRE_PG = os.environ.get('REQUIRE_PG', '1') == '1'
+
+# 从 YAML 配置加载策略参数
+STRATEGY_CONFIGS = load_all_strategies(enabled_only=True)
+print(f"[策略配置] 从 YAML 加载 {len(STRATEGY_CONFIGS)} 个策略: {', '.join(STRATEGY_CONFIGS.keys())}")
 
 
 def _is_postgres_target(target: str) -> bool:
@@ -722,20 +728,14 @@ def run_strategy(name, rsi_thresh, bb_mult, weak_thresh, vol_required, topn, mar
     picks.sort(key=lambda x: x[2])
     return picks[:20], market_ok
 
-# === 历史/对照策略：Fstop3_pt5 v10（不再纳入正式策略池）===
-# Fstop3 仍计算结果，但不参与正式推送
-print(f"\n=== Fstop3_pt5 v10（历史/对照，不纳入正式池）===")
-if STRATEGY_QUALIFIED.get('Fstop3_pt5_v10', False):
-    picks_v10, _ = run_strategy("Fstop3_pt5", 18, 1.0, 50, True, 0, market_ok_50)
-    print(f"  (合格但已降级为历史/对照策略，不参与正式推送) 候选: {len(picks_v10)} 只")
-else:
-    picks_v10 = []
-    print("  不合格，已从正式策略池移除")
-
 # === 正式策略1: BB1.00 ===
-print(f"\n=== BB1.00 ===")
+cfg_b100 = STRATEGY_CONFIGS.get('BB1.00', {})
+print(f"\n=== {cfg_b100.get('name', 'BB1.00')} ===")
 if STRATEGY_QUALIFIED.get('BB1.00', False):
-    picks_b1, _ = run_strategy("BB1.00", 20, 1.00, 70, False, 300, market_ok_70)
+    picks_b1, _ = run_strategy("BB1.00",
+        cfg_b100.get('rsi_threshold', 20), cfg_b100.get('bb_mult', 1.00),
+        cfg_b100.get('weak_pct', 70), cfg_b100.get('vol_required', False),
+        cfg_b100.get('top_n', 300), market_ok_70)
     print(f"候选: {len(picks_b1)} 只")
     for p in picks_b1:
         print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f}")
@@ -744,15 +744,18 @@ else:
     print("策略未通过门槛，已跳过")
 
 # === 正式策略2: BB1.02 + KDJ Oversold ===
-print(f"\n=== BB1.02+KDJ（TOP500 7天）===")
+cfg_kdj = STRATEGY_CONFIGS.get('BB1.02_KDJ', {})
+print(f"\n=== {cfg_kdj.get('name', 'BB1.02_KDJ')}（TOP{cfg_kdj.get('top_n', 500)} {cfg_kdj.get('hold_days', 7)}天）===")
 if STRATEGY_QUALIFIED.get('BB1.02_KDJ', False):
-    # KDJ过滤：在SQL里直接用 (kdj_k < 20 OR kdj_j < 0)
-    cond_sql_kdj = f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * 1.02 AND (kdj_k < 20 OR kdj_j < 0)"
-    # 一字板过滤 + 成交量下限
+    bb_m = cfg_kdj.get('bb_mult', 1.02)
+    rsi_t = cfg_kdj.get('rsi_threshold', 20)
+    top_n_kdj = cfg_kdj.get('top_n', 500)
+    weak_t = cfg_kdj.get('weak_pct', 70)
+    cond_sql_kdj = f"rsi14 < {rsi_t} AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * {bb_m} AND (kdj_k < 20 OR kdj_j < 0)"
     cond_sql_kdj += " AND NOT (open = close AND close = high AND high = low)"
     cond_sql_kdj += " AND volume > 10000"
-    top500_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:500]}
-    cond_sql_kdj += f" AND symbol IN {sql_in_list(sorted(top500_syms))}"
+    top_syms_kdj = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:top_n_kdj]}
+    cond_sql_kdj += f" AND symbol IN {sql_in_list(sorted(top_syms_kdj))}"
 
     candidates_kdj = db_fetchall(db, f"""
         SELECT symbol, close, rsi14, boll_lower, kdj_k, kdj_j FROM kline_daily
@@ -761,7 +764,8 @@ if STRATEGY_QUALIFIED.get('BB1.02_KDJ', False):
     """)
 
     picks_kdj = []
-    if market_ok_70:
+    market_ok_kdj = weak_pct >= weak_t
+    if market_ok_kdj:
         for sym, close, rsi, bb, k, j in candidates_kdj:
             picks_kdj.append((sym, close, rsi, bb, 0, fund.get(sym, 0)))
     picks_kdj.sort(key=lambda x: x[2])
@@ -778,14 +782,20 @@ picks_a = []
 print(f"\n=== 策略A（已停用）===")
 print("因近期真实可买表现偏弱且存在明显 T+1 劣化，已从正式策略池移除，仅保留历史记录用于复盘。")
 
-# === 正式策略4: 策略E（TP4.5：RSI20 + BB1.00 + VOL1.1 + 弱市40% + TOP800 + SL3.5/TP4.5 + H5）===
-print(f"\n=== 策略E（TP4.5，RSI20+BB1.00+VOL1.1+弱市40%+TOP800）===")
-print(f"大盘弱市 {weak_pct:.1f}%（需40%:{'✅' if weak_pct >= 40 else '❌'}）")
+# === 正式策略4: TP4.5 ===
+cfg_tp45 = STRATEGY_CONFIGS.get('TP4.5', {})
+print(f"\n=== {cfg_tp45.get('name', 'TP4.5')}（RSI{cfg_tp45.get('rsi_threshold',20)}+BB{cfg_tp45.get('bb_mult',1.0)}+VOL{cfg_tp45.get('vol_ratio',1.1)}+弱市{cfg_tp45.get('weak_pct',40)}%+TOP{cfg_tp45.get('top_n',800)}）===")
+weak_t_tp = cfg_tp45.get('weak_pct', 40)
+print(f"大盘弱市 {weak_pct:.1f}%（需{weak_t_tp}%:{'✅' if weak_pct >= weak_t_tp else '❌'}）")
 if STRATEGY_QUALIFIED.get('StrategyE_TP45', False):
-    top800_syms_e = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:800]}
+    rsi_t_tp = cfg_tp45.get('rsi_threshold', 20)
+    bb_m_tp = cfg_tp45.get('bb_mult', 1.0)
+    top_n_tp = cfg_tp45.get('top_n', 800)
+    vol_r_tp = cfg_tp45.get('vol_ratio', 1.1)
+    top_syms_e = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:top_n_tp]}
     cond_sql_e = (
-        f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL "
-        f"AND close <= boll_lower * 1.0 AND symbol IN {sql_in_list(sorted(top800_syms_e))}"
+        f"rsi14 < {rsi_t_tp} AND boll_lower IS NOT NULL AND close IS NOT NULL "
+        f"AND close <= boll_lower * {bb_m_tp} AND symbol IN {sql_in_list(sorted(top_syms_e))}"
         f" AND NOT (open = close AND close = high AND high = low)"
         f" AND volume > 10000"
     )
@@ -796,10 +806,10 @@ if STRATEGY_QUALIFIED.get('StrategyE_TP45', False):
     """)
 
     picks_e = []
-    if weak_pct >= 40:
+    if weak_pct >= weak_t_tp:
         for sym, close, rsi, bb in candidates_e:
             vr = vol_ratio(sym)
-            if vr >= 1.1:
+            if vr >= vol_r_tp:
                 picks_e.append((sym, close, rsi, bb, vr, fund.get(sym, 0)))
     picks_e.sort(key=lambda x: x[2])
     picks_e = picks_e[:20]
@@ -810,20 +820,13 @@ else:
     picks_e = []
     print("策略未通过门槛，已跳过")
 
-STRATEGY_EXECUTION_RULES = {
-    'BB1.00': {
-        'buy': '信号日次一交易日开盘买入；若开盘接近涨停、明显一字板、流动性过差或突发利空，则跳过。',
-        'sell': '固定持有7个交易日，于第8个交易日收盘卖出；不设止损止盈。',
-    },
-    'BB1.02_KDJ': {
-        'buy': '信号日次一交易日开盘买入；若开盘接近涨停、明显高开失真、流动性过差或突发利空，则跳过。',
-        'sell': '固定持有7个交易日，于第8个交易日收盘卖出；不设止损止盈。',
-    },
-    'StrategyE_TP45': {
-        'buy': '信号日次一交易日开盘买入；仅在弱市≥40%触发当日信号时参与，且需能严格执行止损止盈。',
-        'sell': 'T+2起按收盘检查止损-3.5%或止盈+4.5%；若5个交易日内均未触发，则第6个交易日收盘卖出。',
-    },
-}
+# 交易规则从 YAML 配置读取
+STRATEGY_EXECUTION_RULES = {}
+for _sname, _scfg in STRATEGY_CONFIGS.items():
+    STRATEGY_EXECUTION_RULES[_sname] = {
+        'buy': _scfg.get('buy_rule', ''),
+        'sell': _scfg.get('sell_rule', ''),
+    }
 
 # === 历史记录 ===
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'reports', 'daily_picks')
@@ -837,18 +840,18 @@ result_record = {
     },
     "strategies": {
         "BB1.00": {
-            "buy_rule": STRATEGY_EXECUTION_RULES['BB1.00']['buy'],
-            "sell_rule": STRATEGY_EXECUTION_RULES['BB1.00']['sell'],
+            "buy_rule": STRATEGY_EXECUTION_RULES.get('BB1.00', {}).get('buy', ''),
+            "sell_rule": STRATEGY_EXECUTION_RULES.get('BB1.00', {}).get('sell', ''),
             "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_b1]
         },
         "BB1.02_KDJ": {
-            "buy_rule": STRATEGY_EXECUTION_RULES['BB1.02_KDJ']['buy'],
-            "sell_rule": STRATEGY_EXECUTION_RULES['BB1.02_KDJ']['sell'],
+            "buy_rule": STRATEGY_EXECUTION_RULES.get('BB1.02_KDJ', {}).get('buy', ''),
+            "sell_rule": STRATEGY_EXECUTION_RULES.get('BB1.02_KDJ', {}).get('sell', ''),
             "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_kdj]
         },
-        "StrategyE_TP45": {
-            "buy_rule": STRATEGY_EXECUTION_RULES['StrategyE_TP45']['buy'],
-            "sell_rule": STRATEGY_EXECUTION_RULES['StrategyE_TP45']['sell'],
+        "TP4.5": {
+            "buy_rule": STRATEGY_EXECUTION_RULES.get('TP4.5', {}).get('buy', ''),
+            "sell_rule": STRATEGY_EXECUTION_RULES.get('TP4.5', {}).get('sell', ''),
             "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_e]
         },
     },

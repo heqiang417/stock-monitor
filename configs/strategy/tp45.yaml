@@ -1,0 +1,25 @@
+# TP4.5 策略参数配置（原 fstop3_pt5_v10）
+name: "TP4.5"
+version: "tp45"
+enabled: true
+
+# 选股参数
+signal_fn: "signal_rsi_vol"
+rsi_threshold: 20
+bb_mult: 1.00
+near_oversold: true
+kdj_filter: false
+vol_required: true
+vol_ratio: 1.1           # 放量倍数
+weak_pct: 40             # 弱市阈值（%个股<MA20）
+top_n: 800
+
+# 卖出参数
+hold_days: 5
+sell_mode: "stop_profit"  # 止损止盈模式
+stop_loss: 3.5
+take_profit: 4.5
+
+# 交易规则
+buy_rule: "信号日次一交易日开盘买入；仅在弱市≥40%触发当日信号时参与，且需能严格执行止损止盈。"
+sell_rule: "T+2起按收盘检查止损-3.5%或止盈+4.5%；若5个交易日内均未触发，则第6个交易日收盘卖出。"

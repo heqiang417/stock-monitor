@@ -1,18 +1,25 @@
-# BB1.02+KDJ Oversold 策略参数配置
+# BB1.02 + KDJ Oversold 策略参数配置
+name: "BB1.02_KDJ"
 version: "bb102_kdj"
+enabled: true
 
 # 选股参数
+signal_fn: "signal_rsi_bb_kdj"
 rsi_threshold: 20
 bb_mult: 1.02
-kdj_filter: true        # KDJ超卖过滤
+near_oversold: true
+kdj_filter: true          # KDJ超卖过滤 (K<20 OR J<0)
 vol_required: false
+vol_ratio: 1.0
 weak_pct: 70
 top_n: 500
 
 # 卖出参数
 hold_days: 7
-sell_mode: "no_stop"
+sell_mode: "hold_fixed"
+stop_loss: null
+take_profit: null
 
-# 评估用
-eval_trades_file: "/home/heqiang/.openclaw/workspace/backtest/trades_v10_BB1.02_KDJ.json"
-eval_result_file: "/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results/weak_filter_compare.json"
+# 交易规则
+buy_rule: "信号日次一交易日开盘买入；若开盘接近涨停、明显高开失真、流动性过差或突发利空，则跳过。"
+sell_rule: "固定持有7个交易日，于第8个交易日收盘卖出；不设止损止盈。"

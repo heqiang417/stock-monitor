@@ -1,17 +1,25 @@
 # BB1.00 策略参数配置
+name: "BB1.00"
 version: "bb100"
+enabled: true
 
 # 选股参数
+signal_fn: "signal_rsi_bb"
 rsi_threshold: 20
 bb_mult: 1.00
+near_oversold: true
+kdj_filter: false
 vol_required: false
+vol_ratio: 1.0
 weak_pct: 70
 top_n: 300
 
 # 卖出参数
 hold_days: 7
-sell_mode: "no_stop"     # 不设止损止盈，持有7天
+sell_mode: "hold_fixed"     # 固定持有N天
+stop_loss: null
+take_profit: null
 
-# 评估用
-eval_trades_file: "/home/heqiang/.openclaw/workspace/backtest/trades_v10_BB1.00.json"
-eval_result_file: "/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results/bb100_full_28metrics.json"
+# 交易规则
+buy_rule: "信号日次一交易日开盘买入；若开盘接近涨停、明显一字板、流动性过差或突发利空，则跳过。"
+sell_rule: "固定持有7个交易日，于第8个交易日收盘卖出；不设止损止盈。"
