@@ -58,12 +58,9 @@ pending_alerts.json
 
 # 评估输出（临时，每次评估都重新生成）
 evaluate_result.json
-evaluate_result.md
 
 # 回测 & 测试报告（只在数据目录，不包括 docs/ 下的策略文档）
 *_results.json
-*_summary.md
-data/**/*_report.md
 data/**/*_summary.json
 backfill_*.txt
 data/failed_*.txt
@@ -74,7 +71,6 @@ scripts/reports/daily_picks/*.json
 
 # 探索结果（运行产物，不纳入版本控制）
 data/results/explore_direction_*.json
-results/strategy_explorer_report.md
 
 # 大量历史回测报告：默认不自动纳入版本控制，正式报告再手动挑选
 # docs/backtesting/reports/*.md
@@ -132,3 +128,4 @@ data/results/
 !data/results/best_RSI20_weak80/
 !data/results/best_RSI<20_weak80%/
 data/results/agent_candidates.jsonl
+.gstack/
