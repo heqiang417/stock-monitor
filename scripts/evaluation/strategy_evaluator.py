@@ -389,7 +389,7 @@ class StrategyEvaluator:
                     scored.append((sym, latest))
             scored.sort(key=lambda x: -x[1])
             self.monthly_top[ms] = [s[0] for s in scored[:TOP_N]]
-            dt = me_dt.replace(day=1)
+            dt = (me_dt + timedelta(days=1)).replace(day=1)
 
     # --------------------------------------------------------
     # 内置信号函数
@@ -565,7 +565,7 @@ class StrategyEvaluator:
                     if latest > 0: scored.append((sym, latest))
                 scored.sort(key=lambda x: -x[1])
                 monthly[ms] = [s[0] for s in scored[:top_n]]
-                dt = me_dt.replace(day=1)
+                dt = (me_dt + timedelta(days=1)).replace(day=1)
         else:
             monthly = self.monthly_top
 
@@ -698,7 +698,7 @@ class StrategyEvaluator:
                         else:
                             i += 1
                     # end while
-                dt = me_dt.replace(day=1)
+                dt = (me_dt + timedelta(days=1)).replace(day=1)  # 下个月1号
 
                 # 处理 daily top_n 筛选
                 if top_n_per_day > 0 and daily_signals:
