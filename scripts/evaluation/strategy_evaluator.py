@@ -74,7 +74,8 @@ def _get_latest_db_date() -> str:
         if latest:
             # 取昨天作为截止（确保T日K线已完整）
             from datetime import date
-            d = datetime.strptime(latest, '%Y-%m-%d').date()
+            latest_str = str(latest) if not isinstance(latest, str) else latest
+            d = datetime.strptime(latest_str, '%Y-%m-%d').date()
             yesterday = (d - timedelta(days=1)).strftime('%Y-%m-%d')
             return yesterday
     except Exception:
@@ -304,7 +305,8 @@ class StrategyEvaluator:
         for sym, rd, roe, rg, pg, gm, dr in fund_rows:
             s = fund_score(roe, rg, pg, gm, dr)
             if s > 0 and rd:
-                pd = (datetime.strptime(rd, '%Y-%m-%d') + timedelta(days=pit_delay_days(rd))).strftime('%Y-%m-%d')
+                rd_str = str(rd) if not isinstance(rd, str) else rd
+                pd = (datetime.strptime(rd_str, '%Y-%m-%d') + timedelta(days=pit_delay_days(rd_str))).strftime('%Y-%m-%d')
                 self.sym_scores.setdefault(sym, []).append((pd, s))
         self.log(f"  PIT评分: {len(self.sym_scores)} 只")
 
