@@ -515,6 +515,23 @@ class StrategyEvaluator:
             all_holds = []  # 记录每笔实际持仓天数
             stocks_hit = set()
 
+            def is_tradable(sd, idx, use_open=False):
+                if idx < 0 or idx >= len(sd['dates']):
+                    return False
+                vol = sd['volume'][idx]
+                px = sd['open'][idx] if use_open else sd['close'][idx]
+                if np.isnan(vol) or np.isnan(px):
+                    return False
+                return vol > 0 and px > 0
+
+            def next_tradable_idx(sd, start_idx, use_open=False):
+                idx = start_idx
+                while idx < len(sd['dates']):
+                    if is_tradable(sd, idx, use_open=use_open):
+                        return idx
+                    idx += 1
+                return None
+
             dt = datetime.strptime(ps, '%Y-%m-%d').replace(day=1)
             end_dt = datetime.strptime(pe, '%Y-%m-%d')
 
@@ -542,35 +559,64 @@ class StrategyEvaluator:
                         if use_weak and not weak_dates.get(d, False): i += 1; continue
 
                         if signal_fn(sd, i, params):
-                            bp = sd['open'][i + 1]
-                            if bp <= 0 or np.isnan(bp):
+                            # 一字板过滤（涨停/跌停均不可买入）
+                            if (not np.isnan(sd['open'][i]) and
+                                sd['open'][i] == sd['close'][i] ==
+                                sd['high'][i] == sd['low'][i]):
+                                i += 1; continue
+                            # 成交量下限：排除流动性极差的个股
+                            if not np.isnan(sd['volume'][i]) and sd['volume'][i] <= 10000:
                                 i += 1; continue
 
+                            buy_idx = next_tradable_idx(sd, i + 1, use_open=True)
+                            if buy_idx is None:
+                                i += 1; continue
+
+                            bp = sd['open'][buy_idx]
+
                             if sell_mode == 'stop_profit':
-                                # 止损/止盈模式：T+2起每日检查，最多持有 hold_days 天
+                                # 从买入后的下一可交易日起，最多持有 hold_days 个可交易日
                                 sell_idx = None
-                                for d_idx in range(i + 2, i + 2 + hold_days):
-                                    if d_idx >= len(sd['dates']): break
-                                    day_close = sd['close'][d_idx]
-                                    if np.isnan(day_close): break
-                                    pct_chg = (day_close - bp) / bp * 100
-                                    if pct_chg <= -stop_loss or pct_chg >= take_profit:
-                                        sell_idx = d_idx
-                                        break
+                                tradable_seen = 0
+                                scan_idx = buy_idx + 1
+                                while scan_idx < len(sd['dates']) and tradable_seen < hold_days:
+                                    if is_tradable(sd, scan_idx):
+                                        tradable_seen += 1
+                                        day_close = sd['close'][scan_idx]
+                                        pct_chg = (day_close - bp) / bp * 100
+                                        if pct_chg <= -stop_loss or pct_chg >= take_profit:
+                                            sell_idx = scan_idx
+                                            break
+                                    scan_idx += 1
                                 if sell_idx is None:
-                                    sell_idx = i + 1 + hold_days
-                                    if sell_idx >= len(sd['dates']):
+                                    tradable_seen = 0
+                                    scan_idx = buy_idx
+                                    while scan_idx < len(sd['dates']):
+                                        if is_tradable(sd, scan_idx):
+                                            tradable_seen += 1
+                                            if tradable_seen > hold_days:
+                                                sell_idx = scan_idx
+                                                break
+                                        scan_idx += 1
+                                    if sell_idx is None:
                                         i += 1; continue
                             else:
-                                # 固定持有模式：T+1+N 收盘卖出
-                                sell_idx = i + 1 + hold_days
-                                if sell_idx >= len(sd['dates']):
+                                # fixed_hold: 持有 hold_days 个可交易日后，在下一可交易日收盘卖出
+                                tradable_seen = 0
+                                sell_idx = None
+                                scan_idx = buy_idx
+                                while scan_idx < len(sd['dates']):
+                                    if is_tradable(sd, scan_idx):
+                                        tradable_seen += 1
+                                        if tradable_seen > hold_days:
+                                            sell_idx = scan_idx
+                                            break
+                                    scan_idx += 1
+                                if sell_idx is None:
                                     i += 1; continue
 
                             sp = sd['close'][sell_idx]
-                            if np.isnan(sp):
-                                i += 1; continue
-                            actual_hold = sell_idx - (i + 1)  # 实际持仓天数
+                            actual_hold = sell_idx - buy_idx  # 实际持仓天数（交易日索引差）
                             if top_n_per_day > 0:
                                 # 计算排序分数
                                 if score_fn is not None:

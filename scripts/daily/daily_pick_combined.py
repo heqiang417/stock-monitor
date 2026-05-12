@@ -15,9 +15,25 @@ Fstop3_pt5 v10：已降级为历史/对照策略，不再纳入正式每日策�
 import sqlite3, json, subprocess, os, argparse, time, requests
 from datetime import datetime, timedelta
 from collections import defaultdict
+from urllib.parse import urlparse
 import sys
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from sync_health import (
+    assess_trade_date_health,
+    find_best_trade_date,
+    read_sync_status,
+)
+from db import _is_postgres_target
+
 # 动态加载策略一致性校验（推送前查评估结果）
+
 def load_strategy_metrics():
     """返回策略key->显示字符串的字典，无评估文件时返回None走降级"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -175,49 +191,166 @@ parser.add_argument('--also-group', action='store_true', help='同时推送到�
 parser.add_argument('--wait', action='store_true')
 args = parser.parse_args()
 
-DB_PATH = os.environ.get('STOCK_DB', '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db')
-READY_FLAG = '/tmp/stock_data_ready.flag'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(SCRIPT_DIR)), '.env')
+if os.path.exists(ENV_FILE):
+    try:
+        with open(ENV_FILE, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+
+DB_TARGET = os.environ.get('POSTGRES_DSN') or os.environ.get('PG_DSN') or os.environ.get('DATABASE_URL') or os.environ.get('DB_DSN') or os.environ.get('STOCK_DB', '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db')
+DB_PATH = DB_TARGET
+READY_FLAG = '/tmp/stock_data_ready.flag'
 UPDATE_TENCENT = os.path.join(SCRIPT_DIR, 'update_tencent.py')
 DAILY_SYNC = os.path.join(SCRIPT_DIR, 'daily_sync.py')
 TODAY = datetime.now().strftime('%Y-%m-%d')
-MIN_STOCKS = 4000
+MIN_STOCKS = 3000
 VALID_LOOKBACK_DAYS = 10
 STRATEGY_VERSION = "combined-v1.3"
+REQUIRE_PG = os.environ.get('REQUIRE_PG', '1') == '1'
 
-db = sqlite3.connect(DB_PATH)
-db.execute('PRAGMA journal_mode=WAL')
+
+def _is_postgres_target(target: str) -> bool:
+    return isinstance(target, str) and target.startswith(('postgresql://', 'postgres://'))
+
+
+def _postgres_connect_kwargs(target: str) -> dict:
+    parsed = urlparse(target)
+    return {
+        'host': parsed.hostname or '127.0.0.1',
+        'port': parsed.port or 5432,
+        'user': parsed.username,
+        'password': parsed.password,
+        'dbname': parsed.path.lstrip('/'),
+        'connect_timeout': 10,
+    }
+
+
+def connect_db():
+    if _is_postgres_target(DB_TARGET):
+        import psycopg2
+        conn = psycopg2.connect(**_postgres_connect_kwargs(DB_TARGET))
+        conn.autocommit = False
+        return conn
+    if REQUIRE_PG:
+        raise RuntimeError(
+            f"daily_pick_combined.py requires PostgreSQL for production, but resolved DB_TARGET={DB_TARGET!r}. "
+            f"Remove SQLite STOCK_DB override or set POSTGRES_DSN/PG_DSN/DATABASE_URL."
+        )
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+
+def q(sql: str) -> str:
+    return sql.replace('?', '%s') if _is_postgres_target(DB_TARGET) else sql
+
+
+def db_execute(conn, sql: str, params=()):
+    cur = conn.cursor()
+    cur.execute(q(sql), params)
+    return cur
+
+
+def db_fetchone(conn, sql: str, params=()):
+    return db_execute(conn, sql, params).fetchone()
+
+
+def db_fetchall(conn, sql: str, params=()):
+    return db_execute(conn, sql, params).fetchall()
+
+
+def sql_literal(value):
+    if value is None:
+        return 'NULL'
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def sql_in_list(values):
+    if not values:
+        return '(NULL)'
+    return '(' + ','.join(sql_literal(v) for v in values) + ')'
+
+
+db = connect_db()
+
+
+def _health_exec_factory(db):
+    return lambda sql, params=None: db_execute(db, sql, params) if params is not None else db_execute(db, sql)
+
 
 def get_latest_valid_trade_date(db, min_stocks=MIN_STOCKS, lookback_days=VALID_LOOKBACK_DAYS):
-    row = db.execute(
-        f"""
-        SELECT trade_date, COUNT(*) AS cnt
-        FROM kline_daily
-        WHERE trade_date >= date('{TODAY}', '-{lookback_days} day')
-        GROUP BY trade_date
-        HAVING cnt >= {min_stocks}
-        ORDER BY trade_date DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    return row[0] if row else None
+    result = find_best_trade_date(
+        _health_exec_factory(db),
+        lambda r: r.fetchone() if r else None,
+        TODAY,
+        DB_TARGET,
+        min_stocks=min_stocks,
+        lookback_days=lookback_days,
+    )
+    return str(result) if result is not None else None
+
+
+def normalize_date_str(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.strftime('%Y-%m-%d')
+    if hasattr(value, 'strftime'):
+        try:
+            return value.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    return str(value)
+
+
+def to_float(value, default=0.0):
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # === 确定日期 ===
-latest = args.date or TODAY
+latest = normalize_date_str(args.date or TODAY)
 if args.wait and not args.date:
     waited = 0
     while waited < 180:
         ready_date = None
-        try:
-            with open(READY_FLAG) as f:
-                ready_date = f.read().strip()
-        except FileNotFoundError:
-            pass
+        ready_stage = None
+        status = read_sync_status()
+        if status:
+            ready_date = status.get('target_date')
+            ready_stage = status.get('pipeline_stage')
+            if status.get('ready') and ready_date:
+                health = status.get('health') or {}
+                kline_count = health.get('total', 0)
+                if kline_count >= MIN_STOCKS:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据就绪(status): {ready_date} stage={ready_stage} ({kline_count}只)")
+                    latest = ready_date
+                    break
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] STATUS日期{ready_date}数据不足({kline_count}只)，继续等待... ({waited}s)")
+            elif ready_date:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] STATUS存在但未ready: {ready_date} stage={ready_stage}，继续等待... ({waited}s)")
 
-        if ready_date:
-            # ── 关键修复：校验 READY_FLAG 里的日期是否真的有效 ──
-            # 1. 日期不能太老（超过 2 个交易日就认为失效）
+        if not ready_date:
+            try:
+                with open(READY_FLAG) as f:
+                    ready_date = f.read().strip()
+            except FileNotFoundError:
+                pass
+
+        if ready_date and not status:
             import re
             is_valid_format = bool(re.match(r'^\d{4}-\d{2}-\d{2}$', ready_date))
             is_recent = False
@@ -229,16 +362,15 @@ if args.wait and not args.date:
                 except Exception:
                     pass
 
-            # 2. 日期必须今天或昨天（交易日范围内）
             if is_valid_format and is_recent:
-                # 二次验证：确认数据库里这个日期真的有足够数据
-                row = db.execute(
+                row = db_fetchone(
+                    db,
                     "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?",
                     (ready_date,)
-                ).fetchone()
+                )
                 kline_count = row[0] if row else 0
                 if kline_count >= MIN_STOCKS:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据就绪: {ready_date} ({kline_count}只)")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 数据就绪(flag): {ready_date} ({kline_count}只)")
                     latest = ready_date
                     break
                 else:
@@ -250,7 +382,6 @@ if args.wait and not args.date:
         time.sleep(60)
         waited += 1
     else:
-        # wait超时时，自动回退到最近有效交易日
         fallback = get_latest_valid_trade_date(db)
         if fallback:
             print(f"等待超时，回退到最近有效交易日: {fallback}")
@@ -261,12 +392,11 @@ if args.wait and not args.date:
             exit(1)
 
     db.close()
-    db = sqlite3.connect(DB_PATH)
-    db.execute('PRAGMA journal_mode=WAL')
+    db = connect_db()
 
 # 若未指定日期且当前 latest 数据不足，自动回退到最近有效交易日
 if not args.date:
-    latest_total = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest,)).fetchone()[0]
+    latest_total = db_fetchone(db, "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest,))[0]
     if latest_total < MIN_STOCKS:
         fallback = get_latest_valid_trade_date(db)
         if fallback and fallback != latest:
@@ -275,38 +405,41 @@ if not args.date:
 
 # === 数据校验 ===
 def get_latest_trade_date(db):
-    row = db.execute("SELECT MAX(trade_date) FROM kline_daily").fetchone()
-    return row[0] if row and row[0] else None
+    row = db_fetchone(db, "SELECT MAX(trade_date) FROM kline_daily")
+    return normalize_date_str(row[0]) if row and row[0] else None
 
 def get_trade_day_gap(db, from_date, to_date):
     if not from_date or not to_date:
         return None
-    row = db.execute(
+    row = db_fetchone(
+        db,
         """
         SELECT COUNT(DISTINCT trade_date)
         FROM kline_daily
         WHERE trade_date > ? AND trade_date <= ?
         """,
         (from_date, to_date)
-    ).fetchone()
+    )
     return row[0] if row else None
 
 def validate(db, date):
-    errors = []
-    warnings = []
-    total = db.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{date}'").fetchone()[0]
-    if total < MIN_STOCKS:
-        errors.append(f"K线不足: {total}只")
-    has_rsi = db.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{date}' AND rsi14 IS NOT NULL").fetchone()[0]
-    has_bb = db.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{date}' AND boll_lower IS NOT NULL").fetchone()[0]
-    if has_rsi < total * 0.8:
-        errors.append(f"RSI未计算: {has_rsi}/{total}")
-    if has_bb < total * 0.8:
-        errors.append(f"BB未计算: {has_bb}/{total}")
+    health = assess_trade_date_health(
+        _health_exec_factory(db),
+        lambda r: r.fetchone() if r else None,
+        TODAY,
+        date,
+        min_stocks=MIN_STOCKS,
+        db_target=DB_TARGET,
+    )
+    errors = list(health['errors'])
+    warnings = list(health['warnings'])
+    total = health['total']
+    has_rsi = health['rsi']
+    has_bb = health['bb']
 
     def max_date(table, col):
         try:
-            row = db.execute(f"SELECT MAX({col}) FROM {table}").fetchone()
+            row = db_fetchone(db, f"SELECT MAX({col}) FROM {table}")
             return row[0] if row else None
         except Exception:
             return None
@@ -326,13 +459,17 @@ def validate(db, date):
         'shareholder': max_date('shareholder_data', 'announcement_date') or max_date('shareholder_data', 'report_date'),
     }
 
-    # 这些先作为选股前可见告警，不阻塞当前流程；未来策略真依赖时再升级为硬错误
+    status = read_sync_status() or {}
+    degraded_flow = status.get('capital_flow', {}) if isinstance(status, dict) else {}
     for key, value in ext.items():
         if not value:
             warnings.append(f"{key}无数据")
             continue
         if str(value) < str(date):
-            warnings.append(f"{key}未到目标日: 最新{value}")
+            if key == 'capital_flow' and degraded_flow.get('status') == 'degraded':
+                warnings.append(f"{key}已降级: 最新{value}，原因={degraded_flow.get('reason', 'unknown')}")
+            else:
+                warnings.append(f"{key}未到目标日: 最新{value}")
 
     return errors, {
         'total': total,
@@ -422,9 +559,8 @@ if errors and not args.date:
     repaired = try_repair_before_pick(latest)
     if repaired:
         db.close()
-        db = sqlite3.connect(DB_PATH)
-        db.execute('PRAGMA journal_mode=WAL')
-        latest_total = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest,)).fetchone()[0]
+        db = connect_db()
+        latest_total = db_fetchone(db, "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest,))[0]
         if latest_total < MIN_STOCKS:
             fallback = get_latest_valid_trade_date(db)
             if fallback and fallback != latest:
@@ -448,12 +584,12 @@ if stale_trade_days and stale_trade_days > 0:
     print(f"⚠️ 数据滞后: 目标日 {latest}，数据库最新交易日 {latest_trade}，差 {stale_trade_days} 个交易日")
 
 # === 市场宽度 ===
-m = db.execute(f"""
+m = db_fetchone(db, f"""
     SELECT COUNT(*) total,
         SUM(CASE WHEN ma20 IS NOT NULL THEN 1 ELSE 0 END) has_ma20,
         SUM(CASE WHEN ma20 IS NOT NULL AND close<ma20 THEN 1 ELSE 0 END) below
-    FROM kline_daily WHERE trade_date='{latest}'
-""").fetchone()
+    FROM kline_daily WHERE trade_date={sql_literal(latest)}
+""")
 total_mkt = m[1] or 1
 weak_pct = (m[2] or 0) / total_mkt * 100
 market_ok_50 = weak_pct >= 50
@@ -461,16 +597,19 @@ market_ok_70 = weak_pct >= 70
 print(f"大盘弱市: {weak_pct:.1f}%个股在MA20下方（需50%:{market_ok_50} | 需70%:{market_ok_70}）")
 
 # === 基本面打分 ===
-fund_rows = db.execute("""
+fund_rows = db_fetchall(db, """
     SELECT f.symbol, f.roe, f.revenue_growth, f.profit_growth, f.gross_margin, f.debt_ratio
     FROM financial_indicators f
     INNER JOIN (SELECT symbol, MAX(report_date) d FROM financial_indicators GROUP BY symbol) t
     ON f.symbol=t.symbol AND f.report_date=t.d
-""").fetchall()
+""")
 
 def score_fund(r):
-    roe=r[1] or 0; rev_g=r[2] or 0; profit_g=r[3] or 0
-    gross=r[4] or 0; debt=r[5] if r[5] is not None else 100
+    roe = to_float(r[1], 0)
+    rev_g = to_float(r[2], 0)
+    profit_g = to_float(r[3], 0)
+    gross = to_float(r[4], 0)
+    debt = to_float(r[5], 100)
     return round(
         min(max(roe/30*30,0),30) +
         min(max((rev_g+20)/60*20,0),20) +
@@ -484,11 +623,11 @@ print(f"基本面TOP300: {len(top300)} 只")
 
 # === 共用成交量数据（30天窗口）===
 cutoff = (datetime.strptime(latest, '%Y-%m-%d') - timedelta(days=30)).strftime('%Y-%m-%d')
-vol_rows = db.execute(f"""
+vol_rows = db_fetchall(db, f"""
     SELECT symbol, trade_date, volume FROM kline_daily
-    WHERE trade_date='{latest}'
-       OR (trade_date <= '{latest}' AND trade_date >= '{cutoff}')
-""").fetchall()
+    WHERE trade_date={sql_literal(latest)}
+       OR (trade_date <= {sql_literal(latest)} AND trade_date >= {sql_literal(cutoff)})
+""")
 
 vol_cache = defaultdict(list)
 for sym, td, vol in vol_rows:
@@ -504,17 +643,17 @@ def vol_ratio(sym):
 
 def recalc_kdj_if_needed(db, date):
     """若当日KDJ全为空，则批量补算"""
-    c = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND kdj_k IS NOT NULL", (date,)).fetchone()[0]
-    total = db.execute("SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (date,)).fetchone()[0]
+    c = db_fetchone(db, "SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND kdj_k IS NOT NULL", (date,))[0]
+    total = db_fetchone(db, "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (date,))[0]
     if c >= total * 0.8:  # 已有80%以上，跳过
         return
     import statistics
     def calc_kdj(symbol, trade_date, n=9):
-        rows = db.execute("""
+        rows = db_fetchall(db, """
             SELECT close, high, low FROM kline_daily 
             WHERE symbol=? AND trade_date<=?
             ORDER BY trade_date DESC LIMIT ?
-        """, (symbol, trade_date, n+20)).fetchall()
+        """, (symbol, trade_date, n+20))
         if len(rows) < n + 1:
             return None, None, None
         rsv_data = []
@@ -530,13 +669,14 @@ def recalc_kdj_if_needed(db, date):
             d_prev = (2/3) * d_prev + (1/3) * k_prev
         j = 3 * k_prev - 2 * d_prev
         return round(k_prev, 2), round(d_prev, 2), round(j, 2)
-    missing = [r[0] for r in db.execute(
-        "SELECT symbol FROM kline_daily WHERE trade_date=? AND kdj_k IS NULL", (date,)).fetchall()]
+    missing = [r[0] for r in db_fetchall(
+        db,
+        "SELECT symbol FROM kline_daily WHERE trade_date=? AND kdj_k IS NULL", (date,))]
     updated = 0
     for sym in missing:
         k, d, j = calc_kdj(sym, date)
         if k is not None:
-            db.execute("UPDATE kline_daily SET kdj_k=?, kdj_d=?, kdj_j=? WHERE symbol=? AND trade_date=?", 
+            db_execute(db, "UPDATE kline_daily SET kdj_k=?, kdj_d=?, kdj_j=? WHERE symbol=? AND trade_date=?", 
                         (k, d, j, sym, date))
             updated += 1
     db.commit()
@@ -549,17 +689,20 @@ recalc_kdj_if_needed(db, latest)
 def run_strategy(name, rsi_thresh, bb_mult, weak_thresh, vol_required, topn, market_ok):
     """运行单个策略，返回候选列表"""
     cond_sql = f"rsi14 < {rsi_thresh} AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * {bb_mult}"
+    # 一字板过滤（跌停/涨停均不可交易）
+    cond_sql += " AND NOT (open = close AND close = high AND high = low)"
+    # 成交量下限：排除流动性极差的个股
+    cond_sql += " AND volume > 10000"
     if topn > 0:
         topn_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:topn]}
         if topn_syms:
-            placeholders = ','.join(f'"{s}"' for s in topn_syms)
-            cond_sql += f" AND symbol IN ({placeholders})"
+            cond_sql += f" AND symbol IN {sql_in_list(sorted(topn_syms))}"
 
-    candidates = db.execute(f"""
+    candidates = db_fetchall(db, f"""
         SELECT symbol, close, rsi14, boll_lower FROM kline_daily
-        WHERE trade_date='{latest}' AND {cond_sql}
+        WHERE trade_date={sql_literal(latest)} AND {cond_sql}
         ORDER BY rsi14 ASC
-    """).fetchall()
+    """)
 
     if not candidates:
         return [], market_ok
@@ -605,15 +748,17 @@ print(f"\n=== BB1.02+KDJ（TOP500 7天）===")
 if STRATEGY_QUALIFIED.get('BB1.02_KDJ', False):
     # KDJ过滤：在SQL里直接用 (kdj_k < 20 OR kdj_j < 0)
     cond_sql_kdj = f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL AND close <= boll_lower * 1.02 AND (kdj_k < 20 OR kdj_j < 0)"
+    # 一字板过滤 + 成交量下限
+    cond_sql_kdj += " AND NOT (open = close AND close = high AND high = low)"
+    cond_sql_kdj += " AND volume > 10000"
     top500_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:500]}
-    placeholders = ','.join(f'\"{s}\"' for s in top500_syms)
-    cond_sql_kdj += f" AND symbol IN ({placeholders})"
+    cond_sql_kdj += f" AND symbol IN {sql_in_list(sorted(top500_syms))}"
 
-    candidates_kdj = db.execute(f"""
+    candidates_kdj = db_fetchall(db, f"""
         SELECT symbol, close, rsi14, boll_lower, kdj_k, kdj_j FROM kline_daily
-        WHERE trade_date='{latest}' AND {cond_sql_kdj}
+        WHERE trade_date={sql_literal(latest)} AND {cond_sql_kdj}
         ORDER BY rsi14 ASC
-    """).fetchall()
+    """)
 
     picks_kdj = []
     if market_ok_70:
@@ -628,51 +773,27 @@ else:
     picks_kdj = []
     print("策略未通过门槛，已跳过")
 
-# === 正式策略3: 策略A（RSI19 + BB1.00 + VOL1.1 + noWeak + TOP800 + SL3.5/TP4.0 + H5）===
-print(f"\n=== 策略A（RSI19+BB1.00+VOL1.1+无弱市过滤+TOP800）===")
-print(f"大盘弱市 {weak_pct:.1f}%（无过滤阈值，每日参与）")
-if STRATEGY_QUALIFIED.get('StrategyA', False):
-    top800_syms = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:800]}
-    placeholders = ','.join(f'"{s}"' for s in top800_syms)
-    cond_sql_a = (
-        f"rsi14 < 19 AND boll_lower IS NOT NULL AND close IS NOT NULL "
-        f"AND close <= boll_lower * 1.0 AND symbol IN ({placeholders})"
-    )
-    candidates_a = db.execute(f"""
-        SELECT symbol, close, rsi14, boll_lower FROM kline_daily
-        WHERE trade_date='{latest}' AND {cond_sql_a}
-        ORDER BY rsi14 ASC
-    """).fetchall()
-
-    picks_a = []
-    for sym, close, rsi, bb in candidates_a:
-        vr = vol_ratio(sym)
-        if vr >= 1.1:
-            picks_a.append((sym, close, rsi, bb, vr, fund.get(sym, 0)))
-    picks_a.sort(key=lambda x: x[2])
-    picks_a = picks_a[:20]
-    print(f"候选: {len(picks_a)} 只")
-    for p in picks_a:
-        print(f"  {p[0]} RSI={p[2]:.1f} close={p[1]:.2f} 放量{p[4]:.2f}x")
-else:
-    picks_a = []
-    print("策略未通过门槛，已跳过")
+# === 正式策略3：已停用（原 StrategyA）===
+picks_a = []
+print(f"\n=== 策略A（已停用）===")
+print("因近期真实可买表现偏弱且存在明显 T+1 劣化，已从正式策略池移除，仅保留历史记录用于复盘。")
 
 # === 正式策略4: 策略E（TP4.5：RSI20 + BB1.00 + VOL1.1 + 弱市40% + TOP800 + SL3.5/TP4.5 + H5）===
 print(f"\n=== 策略E（TP4.5，RSI20+BB1.00+VOL1.1+弱市40%+TOP800）===")
 print(f"大盘弱市 {weak_pct:.1f}%（需40%:{'✅' if weak_pct >= 40 else '❌'}）")
 if STRATEGY_QUALIFIED.get('StrategyE_TP45', False):
     top800_syms_e = {sym for sym,_ in sorted(fund.items(), key=lambda x:-x[1])[:800]}
-    placeholders_e = ','.join(f'"{s}"' for s in top800_syms_e)
     cond_sql_e = (
         f"rsi14 < 20 AND boll_lower IS NOT NULL AND close IS NOT NULL "
-        f"AND close <= boll_lower * 1.0 AND symbol IN ({placeholders_e})"
+        f"AND close <= boll_lower * 1.0 AND symbol IN {sql_in_list(sorted(top800_syms_e))}"
+        f" AND NOT (open = close AND close = high AND high = low)"
+        f" AND volume > 10000"
     )
-    candidates_e = db.execute(f"""
+    candidates_e = db_fetchall(db, f"""
         SELECT symbol, close, rsi14, boll_lower FROM kline_daily
-        WHERE trade_date='{latest}' AND {cond_sql_e}
+        WHERE trade_date={sql_literal(latest)} AND {cond_sql_e}
         ORDER BY rsi14 ASC
-    """).fetchall()
+    """)
 
     picks_e = []
     if weak_pct >= 40:
@@ -698,10 +819,6 @@ STRATEGY_EXECUTION_RULES = {
         'buy': '信号日次一交易日开盘买入；若开盘接近涨停、明显高开失真、流动性过差或突发利空，则跳过。',
         'sell': '固定持有7个交易日，于第8个交易日收盘卖出；不设止损止盈。',
     },
-    'StrategyA': {
-        'buy': '信号日次一交易日开盘买入；仅适合按纪律执行止损止盈，若无法盯盘或无法执行纪律则放弃。',
-        'sell': 'T+2起按收盘检查止损-3.5%或止盈+4.0%；若5个交易日内均未触发，则第6个交易日收盘卖出。',
-    },
     'StrategyE_TP45': {
         'buy': '信号日次一交易日开盘买入；仅在弱市≥40%触发当日信号时参与，且需能严格执行止损止盈。',
         'sell': 'T+2起按收盘检查止损-3.5%或止盈+4.5%；若5个交易日内均未触发，则第6个交易日收盘卖出。',
@@ -712,10 +829,10 @@ STRATEGY_EXECUTION_RULES = {
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'reports', 'daily_picks')
 os.makedirs(HISTORY_DIR, exist_ok=True)
 result_record = {
-    "date": latest,
+    "date": str(latest),
     "meta": {
         "strategy_version": STRATEGY_VERSION,
-        "latest_trade_date": latest_trade,
+        "latest_trade_date": str(latest_trade) if latest_trade else None,
         "stale_trade_days": stale_trade_days or 0
     },
     "strategies": {
@@ -729,16 +846,17 @@ result_record = {
             "sell_rule": STRATEGY_EXECUTION_RULES['BB1.02_KDJ']['sell'],
             "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"fund_score":p[5]} for p in picks_kdj]
         },
-        "StrategyA": {
-            "buy_rule": STRATEGY_EXECUTION_RULES['StrategyA']['buy'],
-            "sell_rule": STRATEGY_EXECUTION_RULES['StrategyA']['sell'],
-            "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_a]
-        },
         "StrategyE_TP45": {
             "buy_rule": STRATEGY_EXECUTION_RULES['StrategyE_TP45']['buy'],
             "sell_rule": STRATEGY_EXECUTION_RULES['StrategyE_TP45']['sell'],
             "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_e]
         },
+    },
+    "disabled_strategies": {
+        "StrategyA": {
+            "status": "disabled",
+            "reason": "近期真实可买表现偏弱，且存在明显T+1开盘劣化；已移出正式策略池，保留历史分析参考。"
+        }
     },
     "reference_strategies": {
         "Fstop3_pt5_v10": {
@@ -811,12 +929,12 @@ def build_section(title, picks, cond_md, note_md, max_show=5, show_vol=False, st
     ]
 
 
-def build_action_advice(picks_e, picks_a, picks_kdj, picks_b1):
+def build_action_advice(picks_e, picks_kdj, picks_b1):
     """生成卡片/文本统一使用的操作建议与Top榜"""
-    strategy_order = {'StrategyE_TP45': 0, 'StrategyA': 1, 'BB1.02_KDJ': 2, 'BB1.00': 3}
+    strategy_order = {'StrategyE_TP45': 0, 'BB1.02_KDJ': 1, 'BB1.00': 2}
     by_symbol = {}
 
-    for strategy, picks in [('StrategyE_TP45', picks_e), ('StrategyA', picks_a), ('BB1.02_KDJ', picks_kdj), ('BB1.00', picks_b1)]:
+    for strategy, picks in [('StrategyE_TP45', picks_e), ('BB1.02_KDJ', picks_kdj), ('BB1.00', picks_b1)]:
         for p in picks:
             sym = p[0]
             rec = by_symbol.setdefault(sym, {
@@ -849,9 +967,6 @@ def build_action_advice(picks_e, picks_a, picks_kdj, picks_b1):
         if 'StrategyE_TP45' in strategies:
             score += 120
             reason_bits.append('命中TP4.5')
-        elif 'StrategyA' in strategies:
-            score += 100
-            reason_bits.append('命中策略A')
         elif 'BB1.02_KDJ' in strategies:
             score += 70
             reason_bits.append('命中BB1.02+KDJ')
@@ -873,7 +988,7 @@ def build_action_advice(picks_e, picks_a, picks_kdj, picks_b1):
 
     total_unique = len(ranked)
     resonance_count = sum(1 for x in ranked if len(x['strategies']) >= 2)
-    total_picks = len(picks_a) + len(picks_kdj) + len(picks_b1)
+    total_picks = len(picks_kdj) + len(picks_b1)
 
     if total_unique == 0:
         summary = '无明显强票，宁可空仓，不建议为凑单强行买入'
@@ -882,14 +997,14 @@ def build_action_advice(picks_e, picks_a, picks_kdj, picks_b1):
         risk = '若强行做，只会放大噪音'
     else:
         focus_n = 2 if total_unique >= 2 else 1
-        summary = f"建议优先看前{min(3, total_unique)}只；共振票{resonance_count}只；优先级：TP4.5 > 策略A > BB1.02+KDJ > BB1.00"
-        focus = f"优先关注：Top{focus_n}{'（先看TP4.5/策略A/共振票）' if any(('StrategyE_TP45' in x['strategies'] or 'StrategyA' in x['strategies']) for x in ranked[:focus_n]) else ''}"
+        summary = f"建议优先看前{min(3, total_unique)}只；共振票{resonance_count}只；优先级：TP4.5 > BB1.02+KDJ > BB1.00"
+        focus = f"优先关注：Top{focus_n}{'（先看TP4.5/共振票）' if any(('StrategyE_TP45' in x['strategies']) for x in ranked[:focus_n]) else ''}"
         position = f"建议持仓：不超过{min(3, total_unique)}只"
         risk = '开盘接近涨停 / 流动性差 / 有明显利空则跳过'
         if total_picks >= 6:
             risk = '候选偏多，只拿前2~3只，别平均分散'
         elif resonance_count == 0:
-            risk = '今日无共振票，优先看TP4.5/策略A前排，降低预期'
+            risk = '今日无共振票，优先看TP4.5前排，降低预期'
 
     top_lines = []
     for idx, rec in enumerate(ranked[:3], 1):
@@ -907,7 +1022,7 @@ def build_action_advice(picks_e, picks_a, picks_kdj, picks_b1):
     }
 
 
-action_advice = build_action_advice(picks_e, picks_a, picks_kdj, picks_b1)
+action_advice = build_action_advice(picks_e, picks_kdj, picks_b1)
 
 elements = [
     {"tag": "div", "text": {"tag": "lark_md", "content": f"**📈 每日选股 {latest} | 正式策略池**"}},
@@ -941,16 +1056,7 @@ elements += build_section(
     note_md="摘要：固定持有型；强调KDJ超卖确认，不做盘中止损止盈。",
     strategy_key='BB1.02_KDJ',
 )
-# 策略A - 动态读取评估结果
-strategy_a_metric = STRATEGY_METRICS.get('StrategyA', '⚠️ 回测指标待更新')
-elements += build_section(
-    title="正式策略3️⃣ 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 无弱市 + TOP800 + 持有5天）",
-    picks=picks_a,
-    cond_md=f"回测：{strategy_a_metric}",
-    note_md="摘要：纪律型止盈止损策略；信号更频繁，但要求执行更强。",
-    show_vol=True,
-    strategy_key='StrategyA',
-)
+# 策略A 已停用，不再展示
 # 策略E（TP4.5）- 动态读取评估结果
 tp45_metric = STRATEGY_METRICS.get('StrategyE_TP45', '⚠️ 回测指标待更新')
 elements += build_section(
@@ -963,7 +1069,7 @@ elements += build_section(
 )
 
 
-elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 正式策略4只 | 不构成投资建议"}]})
+elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"数据:{latest} | 正式策略3只（StrategyA已停用） | 不构成投资建议"}]})
 
 card = {
     "config": {"wide_screen_mode": True},
@@ -1022,14 +1128,6 @@ def build_text_message():
         strategy_key='BB1.02_KDJ'
     )
     lines += format_picks(
-        "正式策略3 策略A（RSI<19 + BB≤1.00 + 放量1.1x + 无弱市 + TOP800 + 持有5天）",
-        picks_a,
-        STRATEGY_METRICS.get('StrategyA', '⚠️ 回测指标待更新'),
-        "纪律型止盈止损策略；信号更频繁，但要求执行更强。",
-        show_vol=True,
-        strategy_key='StrategyA',
-    )
-    lines += format_picks(
         "正式策略4 TP4.5（RSI<20 + BB≤1.00 + 放量1.1x + 弱市40% + TOP800 + 持有5天）",
         picks_e,
         STRATEGY_METRICS.get('StrategyE_TP45', '⚠️ 回测指标待更新'),
@@ -1049,7 +1147,8 @@ def build_text_message():
             lines.append(f"  {t}")
 
     lines.append("")
-    lines.append(f"数据：{latest} | 正式策略4只 | 不构成投资建议")
+    lines.append("说明：正式策略3（StrategyA）已停用，因近期真实可买表现偏弱且存在明显T+1开盘劣化，暂不纳入推荐池。")
+    lines.append(f"数据：{latest} | 正式策略3只（StrategyA已停用） | 不构成投资建议")
     return "\n".join(lines)
 
 text_msg = build_text_message()

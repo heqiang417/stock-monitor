@@ -18,15 +18,16 @@ import json
 import numpy as np
 import os
 import re
-import sqlite3
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 # ===================== 配置 =====================
-DB_PATH = os.getenv("STOCK_DB", "/home/heqiang/stock_data_ro.db")
+DB_TARGET = os.getenv("POSTGRES_DSN") or os.getenv("PG_DSN") or os.getenv("DATABASE_URL") or os.getenv("DB_DSN") or os.getenv("STOCK_DB", "/home/heqiang/stock_data_ro.db")
+DB_PATH = DB_TARGET
 
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
 MINIMAX_BASE_URL = "https://api.minimaxi.com/anthropic/v1"
@@ -45,24 +46,49 @@ PHASES = {
 
 # ===================== 数据库 =====================
 
+def _is_postgres_target(target: str) -> bool:
+    return isinstance(target, str) and target.startswith(("postgresql://", "postgres://"))
+
+
+def _postgres_connect_kwargs(target: str) -> dict:
+    parsed = urlparse(target)
+    return {
+        "host": parsed.hostname or "127.0.0.1",
+        "port": parsed.port or 5432,
+        "user": parsed.username,
+        "password": parsed.password,
+        "dbname": parsed.path.lstrip("/"),
+        "connect_timeout": 10,
+    }
+
+
+def _q(sql: str) -> str:
+    return sql.replace("?", "%s") if _is_postgres_target(DB_TARGET) else sql
+
+
+def db_execute(cursor, sql: str, params=()):
+    return cursor.execute(_q(sql), params)
+
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=5.0)
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA mmap_size=268435456")
-    conn.execute("PRAGMA cache_size=-65536")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    if _is_postgres_target(DB_TARGET):
+        import psycopg2
+        conn = psycopg2.connect(**_postgres_connect_kwargs(DB_TARGET))
+        conn.autocommit = False
+        return conn
+    from db import connect_db
+    return connect_db(DB_PATH)
 
 
 # ===================== 工具层（Layer 2）=====================
 
-def _is_weak_market(conn: sqlite3.Connection, date: str = None) -> bool:
+def _is_weak_market(conn, date: str = None) -> bool:
     """判断当天是否为弱市：全市场 >70% 个股收盘价 < MA20（chg_pct < 0 可作为简化判断）。"""
     try:
         cursor = conn.cursor()
         if date:
             # 指定日期
-            row = cursor.execute("""
+            row = db_execute(cursor, """
                 SELECT COUNT(*) as total,
                        SUM(CASE WHEN chg_pct > 0 THEN 1 ELSE 0 END) as up_count
                 FROM kline_daily
@@ -70,7 +96,7 @@ def _is_weak_market(conn: sqlite3.Connection, date: str = None) -> bool:
             """, (date,)).fetchone()
         else:
             # 最近有数据的交易日
-            row = cursor.execute("""
+            row = db_execute(cursor, """
                 SELECT COUNT(*) as total,
                        SUM(CASE WHEN chg_pct > 0 THEN 1 ELSE 0 END) as up_count
                 FROM kline_daily
@@ -105,7 +131,7 @@ def scan_market(phase: str = "train", limit: int = TOP_N,
 
         # 弱市过滤：取 phase 末段代表日判断
         if weak_filter:
-            recent_date_row = cursor.execute("""
+            recent_date_row = db_execute(cursor, """
                 SELECT MAX(trade_date) FROM kline_daily
                 WHERE trade_date BETWEEN ? AND ?
             """, (start, end)).fetchone()
@@ -115,14 +141,14 @@ def scan_market(phase: str = "train", limit: int = TOP_N,
                             "candidates": [], "weak_filtered": True,
                             "message": "非弱市日，已过滤"}
 
-        rows = cursor.execute("""
+        rows = db_execute(cursor, """
             SELECT symbol, COUNT(*) as days, SUM(volume) as total_vol,
                    AVG(rsi14) as avg_rsi, MAX(rsi14) as max_rsi, MIN(rsi14) as min_rsi
             FROM kline_daily
             WHERE trade_date BETWEEN ? AND ?
               AND volume > 0 AND rsi14 IS NOT NULL
             GROUP BY symbol
-            HAVING days > 100
+            HAVING COUNT(*) > 100
             ORDER BY total_vol DESC
             LIMIT ?
         """, (start, end, effective_n)).fetchall()
@@ -198,7 +224,7 @@ def backtest_signal(symbol: str, signal_type: str, params: dict,
         conn = get_db_connection()
         cursor = conn.cursor()
         start, end = PHASES.get(phase, PHASES["train"])
-        rows = cursor.execute("""
+        rows = db_execute(cursor, """
             SELECT trade_date, open, high, low, close, volume,
                    rsi14, ma5, ma10, ma20,
                    macd_dif, macd_dea, macd_hist,
@@ -231,6 +257,28 @@ def backtest_signal(symbol: str, signal_type: str, params: dict,
         kdj_k    = [r[16] for r in rows]
         kdj_d    = [r[17] for r in rows]
         kdj_j    = [r[18] for r in rows]
+
+        def _is_tradable(idx: int, use_open: bool = False) -> bool:
+            if idx < 0 or idx >= len(rows):
+                return False
+            vol = volumes[idx]
+            px = opens[idx] if use_open else closes[idx]
+            if vol is None or px is None:
+                return False
+            try:
+                if np.isnan(vol) or np.isnan(px):
+                    return False
+            except TypeError:
+                pass
+            return vol > 0 and px > 0
+
+        def _next_tradable_idx(start_idx: int, use_open: bool = False) -> int | None:
+            idx = start_idx
+            while idx < len(rows):
+                if _is_tradable(idx, use_open=use_open):
+                    return idx
+                idx += 1
+            return None
 
         # 预计算 ADX
         adx_list, plus_di_list, minus_di_list = _compute_adx(highs, lows, closes)
@@ -344,9 +392,18 @@ def backtest_signal(symbol: str, signal_type: str, params: dict,
                         trigger = True
 
             if trigger:
+                # 一字板过滤（涨停/跌停均不可买入）
+                if opens[i] == closes[i] == highs[i] == lows[i]:
+                    i += 1; continue
+                # 成交量下限
+                if volumes[i] is not None and volumes[i] <= 10000:
+                    i += 1; continue
+
                 signal_count += 1
-                # T+1 开盘买入
-                buy_idx = i + 1 if i + 1 < len(rows) else i
+                # T+1 开盘买入；若次日停牌/无成交，则顺延到下一可交易日
+                buy_idx = _next_tradable_idx(i + 1, use_open=True)
+                if buy_idx is None:
+                    break
                 ep = rows[buy_idx][1]  # open price
                 ed = dates[buy_idx]
 
@@ -354,23 +411,48 @@ def backtest_signal(symbol: str, signal_type: str, params: dict,
                 sell_mode = params.get("sell_mode", "fixed_hold")
 
                 if sell_mode == "stop_profit":
-                    # T+2 起每日检查止损/止盈
+                    # 从买入后的下一可交易日起，最多持有 hold_days 个可交易日
                     stop_loss = params.get("stop_loss", 3.0)
                     take_profit = params.get("take_profit", 5.0)
                     exit_idx = None
-                    for d in range(i + 2, min(i + hold_days + 1, len(rows))):
-                        day_ret = (rows[d][4] - ep) / ep * 100  # close vs buy_price
-                        if day_ret >= take_profit:
-                            exit_idx = d
-                            break
-                        if day_ret <= -stop_loss:
-                            exit_idx = d
-                            break
+                    tradable_seen = 0
+                    scan_idx = buy_idx + 1
+                    while scan_idx < len(rows) and tradable_seen < hold_days:
+                        if _is_tradable(scan_idx):
+                            tradable_seen += 1
+                            day_ret = (rows[scan_idx][4] - ep) / ep * 100  # close vs buy_price
+                            if day_ret >= take_profit or day_ret <= -stop_loss:
+                                exit_idx = scan_idx
+                                break
+                        scan_idx += 1
                     if exit_idx is None:
-                        exit_idx = min(i + hold_days, len(rows) - 1)
+                        tradable_seen = 0
+                        scan_idx = buy_idx
+                        while scan_idx < len(rows):
+                            if _is_tradable(scan_idx):
+                                tradable_seen += 1
+                                if tradable_seen > hold_days:
+                                    exit_idx = scan_idx
+                                    break
+                            scan_idx += 1
+                        if exit_idx is None:
+                            i += 1
+                            continue
                 else:
-                    # fixed_hold: T+1+N 收盘卖出
-                    exit_idx = min(i + hold_days, len(rows) - 1)
+                    # fixed_hold: 持有 hold_days 个可交易日后，在下一可交易日收盘卖出
+                    tradable_seen = 0
+                    exit_idx = None
+                    scan_idx = buy_idx
+                    while scan_idx < len(rows):
+                        if _is_tradable(scan_idx):
+                            tradable_seen += 1
+                            if tradable_seen > hold_days:
+                                exit_idx = scan_idx
+                                break
+                        scan_idx += 1
+                    if exit_idx is None:
+                        i += 1
+                        continue
 
                 xp = rows[exit_idx][4]  # close price at exit
                 # 双边交易成本 0.30%（买入扣一次，卖出扣一次）
