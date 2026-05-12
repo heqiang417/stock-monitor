@@ -322,7 +322,7 @@ class StrategyEvaluator:
             if len(rows) < 60:
                 continue
 
-            dates = [r[0] for r in rows]
+            dates = [str(r[0]) for r in rows]
             self.sym_data[sym] = {
                 'dates': dates,
                 'open':    np.array([r[1] for r in rows], dtype=float),
