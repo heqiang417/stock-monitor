@@ -316,7 +316,7 @@ class StrategyEvaluator:
             rows = _exec(conn, """
                 SELECT trade_date, open, close, high, low, rsi14,
                        boll_lower, boll_upper, ma5, ma10, ma20,
-                       macd_hist, volume
+                       macd_hist, volume, kdj_k, kdj_d, kdj_j
                 FROM kline_daily
                 WHERE symbol=? AND trade_date>='2020-12-01'
                 ORDER BY trade_date
@@ -339,6 +339,9 @@ class StrategyEvaluator:
                 'ma20':    np.array([r[10] if r[10] is not None else np.nan for r in rows], dtype=float),
                 'macd_hist': np.array([r[11] if r[11] is not None else np.nan for r in rows], dtype=float),
                 'volume':  np.array([r[12] if r[12] is not None else np.nan for r in rows], dtype=float),
+                'kdj_k':   np.array([r[13] if r[13] is not None else np.nan for r in rows], dtype=float),
+                'kdj_d':   np.array([r[14] if r[14] is not None else np.nan for r in rows], dtype=float),
+                'kdj_j':   np.array([r[15] if r[15] is not None else np.nan for r in rows], dtype=float),
             }
         conn.close()
         self.log(f"  K线: {len(self.sym_data)} 只")
@@ -402,12 +405,31 @@ class StrategyEvaluator:
     def signal_rsi_bb(sd, i, params):
         """RSI超卖 + 布林带下轨触底"""
         thresh = params.get('rsi_thresh', 20)
+        bb_mult = params.get('bb_mult', 1.0)
         rsi = sd['rsi'][i]
         if np.isnan(rsi) or rsi >= thresh or rsi < 10:
             return False
         bb = sd['bb_lower'][i]
         cl = sd['close'][i]
-        return not np.isnan(bb) and cl <= bb * 1.02
+        return not np.isnan(bb) and cl <= bb * bb_mult
+
+    @staticmethod
+    def signal_rsi_bb_kdj(sd, i, params):
+        """RSI超卖 + 布林带下轨 + KDJ超卖（BB1.02+KDJ策略）"""
+        thresh = params.get('rsi_thresh', 20)
+        bb_mult = params.get('bb_mult', 1.02)
+        rsi = sd['rsi'][i]
+        if np.isnan(rsi) or rsi >= thresh or rsi < 10:
+            return False
+        bb = sd['bb_lower'][i]
+        cl = sd['close'][i]
+        if np.isnan(bb) or cl > bb * bb_mult:
+            return False
+        kdj_k = sd['kdj_k'][i]
+        kdj_j = sd['kdj_j'][i]
+        if np.isnan(kdj_k) and np.isnan(kdj_j):
+            return False
+        return (not np.isnan(kdj_k) and kdj_k < 20) or (not np.isnan(kdj_j) and kdj_j < 0)
 
     @staticmethod
     def signal_rsi_macd(sd, i, params):
@@ -421,11 +443,16 @@ class StrategyEvaluator:
 
     @staticmethod
     def signal_rsi_vol(sd, i, params):
-        """RSI超卖 + 放量"""
+        """RSI超卖 + 放量 + 布林带下轨"""
         thresh = params.get('rsi_thresh', 20)
         vol_mult = params.get('vol_mult', 1.5)
+        bb_mult = params.get('bb_mult', 1.0)
         rsi = sd['rsi'][i]
         if np.isnan(rsi) or rsi >= thresh or rsi < 10:
+            return False
+        bb = sd['bb_lower'][i]
+        cl = sd['close'][i]
+        if np.isnan(bb) or cl > bb * bb_mult:
             return False
         vol = sd['volume'][i]
         # 用前5日均量判断放量
