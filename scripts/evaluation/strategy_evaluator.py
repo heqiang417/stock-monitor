@@ -22,20 +22,51 @@ import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Dict, List, Tuple
+from urllib.parse import urlparse
 
 # ============================================================
 # 配置
 # ============================================================
-DB = '/mnt/data/workspace/stock-monitor-app-py/data/stock_data.db'
+_pg_dsn = os.environ.get('POSTGRES_DSN') or os.environ.get('PG_DSN') or os.environ.get('DATABASE_URL') or ''
+if _pg_dsn and urlparse(_pg_dsn).scheme in ('postgres', 'postgresql'):
+    DB = _pg_dsn
+else:
+    DB = '/mnt/data/workspace/stock-monitor-app-py/data/stock_data.db'
 TOP_N = 200
 RF = 0.03          # 无风险利率 3%
 COST = 0.30        # 0.15%单边 x2
 OUTPUT_DIR = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/results'
 
+def _is_pg():
+    return DB.startswith(('postgresql://', 'postgres://'))
+
+def _connect():
+    """创建数据库连接（自动判断PG或SQLite）"""
+    if _is_pg():
+        import psycopg2
+        parsed = urlparse(DB)
+        conn = psycopg2.connect(
+            host=parsed.hostname or '127.0.0.1',
+            port=parsed.port or 5432,
+            user=parsed.username, password=parsed.password,
+            dbname=parsed.path.lstrip('/'), connect_timeout=10
+        )
+        conn.autocommit = True
+        return conn
+    return sqlite3.connect(DB)
+
+def _exec(conn, sql, params=None):
+    """执行SQL，PG用%s占位符，SQLite用?"""
+    c = conn.cursor()
+    if _is_pg() and params:
+        sql = sql.replace('?', '%s')
+    c.execute(sql, params or ())
+    return c
+
 def _get_latest_db_date() -> str:
     """从数据库动态获取最近交易日（不包含今天，避免T日数据不完整）"""
     try:
-        conn = sqlite3.connect(DB)
+        conn = _connect()
         c = conn.cursor()
         c.execute("SELECT MAX(trade_date) FROM kline_daily")
         latest = c.fetchone()[0]
@@ -260,9 +291,9 @@ class StrategyEvaluator:
 
         t0 = time.time()
         self.log("加载PIT基本面...")
-        conn = sqlite3.connect(self.db, timeout=120)
+        conn = _connect()
 
-        fund_rows = conn.execute("""
+        fund_rows = _exec(conn, """
             SELECT symbol, report_date, roe, revenue_growth, profit_growth, gross_margin, debt_ratio
             FROM financial_indicators
             WHERE roe IS NOT NULL OR revenue_growth IS NOT NULL OR profit_growth IS NOT NULL
@@ -280,7 +311,7 @@ class StrategyEvaluator:
         self.log("加载K线数据...")
         self.sym_data = {}
         for sym in self.sym_scores:
-            rows = conn.execute("""
+            rows = _exec(conn, """
                 SELECT trade_date, open, close, high, low, rsi14,
                        boll_lower, boll_upper, ma5, ma10, ma20,
                        macd_hist, volume
