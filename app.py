@@ -108,7 +108,7 @@ def create_app(config=None):
     bg_service.set_socketio(socketio)
     
     # ---- Register Blueprints ----
-    _register_blueprints(app, stock_service, strategy_service, backtest_service)
+    _register_blueprints(app, stock_service, strategy_service, backtest_service, config)
     
     # ---- Error Handlers ----
     _register_error_handlers(app)
@@ -229,7 +229,7 @@ def _init_services(config):
     
     logger.info("Initializing services...")
     
-    stock_service = StockService(db_path=config.DB_PATH, config=config)
+    stock_service = StockService(db_path=config.DB_URL, config=config)
     stock_service.init_db()
     
     strategy_service = StrategyService(
@@ -250,7 +250,7 @@ def _init_services(config):
     return stock_service, strategy_service, feishu_service, backtest_service
 
 
-def _register_blueprints(app, stock_service, strategy_service, backtest_service):
+def _register_blueprints(app, stock_service, strategy_service, backtest_service, config):
     """Register all route blueprints."""
     from routes.stock_routes import create_stock_routes
     from routes.strategy_routes import create_strategy_routes
@@ -269,9 +269,9 @@ def _register_blueprints(app, stock_service, strategy_service, backtest_service)
     app.register_blueprint(create_backtest_routes(backtest_service))
     app.register_blueprint(create_alert_routes(strategy_service, stock_service))
     app.register_blueprint(create_kline_routes(stock_service))
-    app.register_blueprint(create_fundamental_routes(app.config.get('DB_PATH', 'data/stock_data.db')))
-    app.register_blueprint(create_analysis_routes(app.config.get('DB_PATH', 'data/stock_data.db')))
-    app.register_blueprint(create_dashboard_routes(app.config.get('DB_PATH', 'data/stock_data.db')))
+    app.register_blueprint(create_fundamental_routes(config.DB_URL))
+    app.register_blueprint(create_analysis_routes(config.DB_URL))
+    app.register_blueprint(create_dashboard_routes(config.DB_URL))
     app.register_blueprint(create_db_routes(stock_service))
     
     # Legacy backtest blueprint
@@ -400,7 +400,7 @@ if __name__ == '__main__':
     app, socketio, bg_service, services = create_app(Config)
     
     logger.info(f"Starting Stock Monitor App on http://0.0.0.0:{Config.PORT}")
-    logger.info(f"Configuration: DB={Config.DB_PATH}, Symbol={Config.STOCK_SYMBOL}")
+    logger.info(f"Configuration: DB={Config.DB_URL}, Symbol={Config.STOCK_SYMBOL}")
     logger.info(f"Log Level: {Config.LOG_LEVEL}, Workers: {Config.MAX_WORKERS}")
     
     # Start background threads via BackgroundService

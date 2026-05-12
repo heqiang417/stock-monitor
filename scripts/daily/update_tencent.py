@@ -19,20 +19,63 @@
   python3 update_tencent.py --fund       # 只同步财务指标
 """
 
-import os, sys, json, sqlite3, time, random, argparse
+import os, sys, json, time, random, argparse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import requests
 import urllib3
+from urllib.parse import urlparse
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import warnings
 warnings.filterwarnings("ignore")
 import numpy as np
+import pandas as pd
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from sync_health import (
+    assess_trade_date_health,
+    find_best_trade_date,
+    write_sync_status,
+)
+
+# 让脚本可复用项目里的 PG/SQLite 兼容 DB 层
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+env_file = os.path.join(PROJECT_ROOT, '.env')
+if os.path.exists(env_file):
+    try:
+        with open(env_file, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+    except Exception:
+        pass
+
+from db import _is_postgres_target, _sqlite_placeholders_to_pyformat
+from data_provider.akshare_fetcher import AkshareFetcher
 
 # === 配置 ===
-DB_PATH = os.environ.get('STOCK_DB',
-    '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db')
+DEFAULT_DB_PATH = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db'
+DB_TARGET = os.environ.get('POSTGRES_DSN') or os.environ.get('PG_DSN') or os.environ.get('DATABASE_URL') or os.environ.get('DB_DSN') or os.environ.get('STOCK_DB') or DEFAULT_DB_PATH
+DB_PATH = DB_TARGET
+DB_IS_POSTGRES = _is_postgres_target(DB_TARGET)
+REQUIRE_PG = os.environ.get('REQUIRE_PG', '1') == '1'
+if REQUIRE_PG and not DB_IS_POSTGRES:
+    raise RuntimeError(
+        f"update_tencent.py requires PostgreSQL for production, but resolved DB_TARGET={DB_TARGET!r}. "
+        f"Remove SQLite STOCK_DB override or set POSTGRES_DSN/PG_DSN/DATABASE_URL."
+    )
 STOCKS_FILE = os.environ.get('STOCKS_FILE',
     '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/stock_data_full.json')
 READY_FLAG = '/tmp/stock_data_ready.flag'
@@ -54,17 +97,91 @@ parser.add_argument('--kline', action='store_true', help='只同步K线')
 parser.add_argument('--fund', action='store_true', help='只同步财务指标')
 parser.add_argument('--no-weekly', action='store_true', help='跳过周K线')
 parser.add_argument('--no-monthly', action='store_true', help='跳过月K线')
+parser.add_argument('--target-date', help='指定目标交易日（YYYY-MM-DD），用于补历史某一天的数据')
+parser.add_argument('--light-target-date', action='store_true', help='指定目标日时启用轻量补数：跳过估值/周月K，只补该日K线+指标')
 args = parser.parse_args()
 
 INCR_DAYS = 60 if args.full else args.days
-TODAY = datetime.now().strftime('%Y-%m-%d')
+TODAY = args.target_date or datetime.now().strftime('%Y-%m-%d')
+TARGET_DATE_MODE = bool(args.target_date)
+LIGHT_TARGET_DATE_MODE = bool(args.light_target_date or args.target_date)
 MIN_STOCKS = 4000
 VALID_LOOKBACK_DAYS = 10
-beg_date = (datetime.now() - timedelta(days=INCR_DAYS + 10)).strftime('%Y-%m-%d')
+if TARGET_DATE_MODE:
+    beg_date = (datetime.strptime(TODAY, '%Y-%m-%d') - timedelta(days=max(INCR_DAYS + 10, 35))).strftime('%Y-%m-%d')
+else:
+    beg_date = (datetime.now() - timedelta(days=INCR_DAYS + 10)).strftime('%Y-%m-%d')
 end_date = TODAY
 
+def _postgres_connect_kwargs(target: str) -> dict:
+    parsed = urlparse(target)
+    return {
+        'host': parsed.hostname or '127.0.0.1',
+        'port': parsed.port or 5432,
+        'user': parsed.username,
+        'password': parsed.password,
+        'dbname': parsed.path.lstrip('/'),
+        'connect_timeout': 10,
+    }
+
+
+def get_conn():
+    if DB_IS_POSTGRES:
+        import psycopg2
+        conn = psycopg2.connect(**_postgres_connect_kwargs(DB_TARGET))
+        conn.autocommit = False
+        return conn
+    from db import connect_db
+    return connect_db(DB_PATH)
+
+
+def _q(sql: str) -> str:
+    return _sqlite_placeholders_to_pyformat(sql) if DB_IS_POSTGRES else sql
+
+
+def _exec(conn, sql: str, params=()):
+    cur = conn.cursor()
+    cur.execute(_q(sql), params)
+    return cur
+
+
+def _execmany(conn, sql: str, params_list):
+    cur = conn.cursor()
+    cur.executemany(_q(sql), params_list)
+    return cur
+
+
+def _fetchall(cur):
+    rows = cur.fetchall()
+    return [tuple(r.values()) if isinstance(r, dict) else tuple(r) for r in rows]
+
+
+def _fetchone(cur):
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return tuple(row.values()) if isinstance(row, dict) else tuple(row)
+
+
+def _table_exists(conn, name: str) -> bool:
+    if DB_IS_POSTGRES:
+        row = _fetchone(_exec(conn, "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=%s LIMIT 1", (name,)))
+        return bool(row)
+    row = _fetchone(_exec(conn, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)))
+    return bool(row)
+
+
+def _upsert_kline_sql(table: str) -> str:
+    return f'''INSERT INTO {table}
+        (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(symbol, trade_date) DO UPDATE SET
+        open=excluded.open, close=excluded.close, high=excluded.high, low=excluded.low,
+        volume=excluded.volume, amount=excluded.amount, chg=excluded.chg, chg_pct=excluded.chg_pct'''
+
+
 # === 日志 ===
-LOG_DIR = os.path.join(os.path.dirname(DB_PATH), '..', 'logs')
+LOG_DIR = os.environ.get('SYNC_LOG_DIR', os.path.join(PROJECT_ROOT, 'logs'))
 os.makedirs(LOG_DIR, exist_ok=True)
 log_file = os.path.join(LOG_DIR, f'tencent_sync_{TODAY}.log')
 
@@ -89,6 +206,29 @@ for s in stocks:
     if not sym.startswith(('sz', 'sh')):
         sym = f'sh{sym}' if sym.startswith('6') else f'sz{sym}'
     stock_list.append(sym)
+
+VALID_SYMBOL_PREFIXES = ('sz', 'sh')
+
+def is_valid_symbol(symbol: str) -> bool:
+    if not symbol or not symbol.startswith(VALID_SYMBOL_PREFIXES):
+        return False
+    code = symbol[2:]
+    return code.isdigit() and len(code) == 6
+
+FETCH_STATS = {
+    'kline': {'network_error': 0, 'parse_error': 0, 'empty_payload': 0, 'success': 0},
+    'quote': {'network_error': 0, 'parse_error': 0, 'empty_payload': 0, 'success': 0},
+    'fallback': {'attempt': 0, 'success': 0, 'no_today': 0, 'error': 0},
+}
+FETCH_STATS_LOCK = threading.Lock()
+_AKSHARE_FETCHER = None
+_AKSHARE_LOCK = threading.Lock()
+
+
+def _bump_fetch_stat(kind, key):
+    with FETCH_STATS_LOCK:
+        FETCH_STATS.setdefault(kind, {}).setdefault(key, 0)
+        FETCH_STATS[kind][key] += 1
 
 log(f'股票总数: {len(stock_list)}, 增量: {INCR_DAYS} 天, 模式: {"全量" if args.full else "增量"}')
 
@@ -115,36 +255,49 @@ def fetch_tencent_kline(symbol, period='day'):
         tsym = symbol
 
     session = _get_session()
-    try:
-        r = session.get(
-            'https://43.154.254.185/appstock/app/fqkline/get',
-            verify=False,
-            headers={'Host': 'web.ifzq.gtimg.cn'}, params={'param': f'{tsym},{period},{beg_date},{end_date},{INCR_DAYS+10},qfq'},
-            timeout=15
-        )
-        d = r.json()
-        data = d.get('data', {}).get(tsym, {})
+    last_error_kind = 'network_error'
+    for _ in range(2):
+        try:
+            r = session.get(
+                'https://43.154.254.185/appstock/app/fqkline/get',
+                verify=False,
+                headers={'Host': 'web.ifzq.gtimg.cn'}, params={'param': f'{tsym},{period},{beg_date},{end_date},{INCR_DAYS+10},qfq'},
+                timeout=15
+            )
+            d = r.json()
+            data = d.get('data', {}).get(tsym, {})
+            days = data.get(period, []) or data.get(f'qfq{period}', [])
+            if not days:
+                last_error_kind = 'empty_payload'
+                time.sleep(0.2)
+                continue
 
-        # 尝试多个可能的key
-        days = data.get(period, []) or data.get(f'qfq{period}', [])
+            result = []
+            for row in days:
+                if len(row) >= 6:
+                    result.append({
+                        'trade_date': row[0],
+                        'open': float(row[1]),
+                        'close': float(row[2]),
+                        'high': float(row[3]),
+                        'low': float(row[4]),
+                        'volume': float(row[5]),
+                        'amount': float(row[6]) if len(row) > 6 else 0,
+                        'chg': float(row[7]) if len(row) > 7 else 0,
+                        'chg_pct': float(row[8]) if len(row) > 8 else 0
+                    })
+            if result:
+                _bump_fetch_stat('kline', 'success')
+                return result
+            last_error_kind = 'parse_error'
+        except requests.RequestException:
+            last_error_kind = 'network_error'
+        except Exception:
+            last_error_kind = 'parse_error'
+        time.sleep(0.2)
 
-        result = []
-        for row in days:
-            if len(row) >= 6:
-                result.append({
-                    'trade_date': row[0],
-                    'open': float(row[1]),
-                    'close': float(row[2]),
-                    'high': float(row[3]),
-                    'low': float(row[4]),
-                    'volume': float(row[5]),
-                    'amount': float(row[6]) if len(row) > 6 else 0,
-                    'chg': float(row[7]) if len(row) > 7 else 0,
-                    'chg_pct': float(row[8]) if len(row) > 8 else 0
-                })
-        return result
-    except Exception as e:
-        return []
+    _bump_fetch_stat('kline', last_error_kind)
+    return []
 
 def fetch_tencent_quote(symbol):
     """腾讯实时行情（含PE/PB）"""
@@ -156,23 +309,86 @@ def fetch_tencent_quote(symbol):
         tsym = symbol
 
     session = _get_session()
-    try:
-        r = session.get(f'https://203.205.235.28/q={tsym}', headers={'Host': 'qt.gtimg.cn'}, verify=False, timeout=15)
-        text = r.text.strip()
-        # 解析: v_sz002149="51~名称~代码~现价~昨收~开盘~..."
-        eq_pos = text.index('=')
-        fields = text[eq_pos+2:-1].split('~')  # 去掉开头引号和结尾引号
-        if len(fields) >= 47:
-            return {
-                'close': float(fields[3]) if fields[3] else None,
-                'pe': float(fields[39]) if fields[39] else None,     # 动态市盈率
-                'pb': float(fields[46]) if fields[46] else None,     # 市净率
-                'volume': float(fields[6]) if fields[6] else 0,
-                'amount': float(fields[37]) if fields[37] else 0,    # 成交额(万)
-            }
-    except Exception as e:
-        pass
+    last_error_kind = 'network_error'
+    for _ in range(2):
+        try:
+            r = session.get(f'https://203.205.235.28/q={tsym}', headers={'Host': 'qt.gtimg.cn'}, verify=False, timeout=15)
+            text = r.text.strip()
+            eq_pos = text.index('=')
+            fields = text[eq_pos+2:-1].split('~')
+            if len(fields) >= 47:
+                _bump_fetch_stat('quote', 'success')
+                return {
+                    'close': float(fields[3]) if fields[3] else None,
+                    'pe': float(fields[39]) if fields[39] else None,
+                    'pb': float(fields[46]) if fields[46] else None,
+                    'volume': float(fields[6]) if fields[6] else 0,
+                    'amount': float(fields[37]) if fields[37] else 0,
+                }
+            last_error_kind = 'empty_payload'
+        except requests.RequestException:
+            last_error_kind = 'network_error'
+        except Exception:
+            last_error_kind = 'parse_error'
+        time.sleep(0.2)
+    _bump_fetch_stat('quote', last_error_kind)
     return None
+
+
+def _get_akshare_fetcher():
+    global _AKSHARE_FETCHER
+    if _AKSHARE_FETCHER is None:
+        with _AKSHARE_LOCK:
+            if _AKSHARE_FETCHER is None:
+                fetcher = AkshareFetcher(priority=1)
+                _AKSHARE_FETCHER = fetcher if fetcher.is_available() else False
+    return _AKSHARE_FETCHER if _AKSHARE_FETCHER is not False else None
+
+
+def _normalize_fallback_df(df):
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return []
+    result = []
+    for _, row in df.iterrows():
+        trade_date = str(row.get('date') or row.get('trade_date') or '')[:10]
+        if not trade_date:
+            continue
+        try:
+            result.append({
+                'trade_date': trade_date,
+                'open': float(row['open']),
+                'close': float(row['close']),
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'volume': float(row.get('volume', 0) or 0),
+                'amount': float(row.get('amount', 0) or 0),
+                'chg': float(row.get('chg', 0) or 0),
+                'chg_pct': float(row.get('chg_pct', 0) or 0),
+            })
+        except Exception:
+            continue
+    return result
+
+
+def fetch_fallback_today_kline(symbol):
+    _bump_fetch_stat('fallback', 'attempt')
+    fetcher = _get_akshare_fetcher()
+    if not fetcher:
+        _bump_fetch_stat('fallback', 'error')
+        return []
+    try:
+        df = fetcher.get_daily_data(symbol, beg_date.replace('-', ''), end_date.replace('-', ''))
+        rows = _normalize_fallback_df(df)
+        rows = [r for r in rows if str(r.get('trade_date')) == TODAY]
+        if rows:
+            _bump_fetch_stat('fallback', 'success')
+            return rows
+        _bump_fetch_stat('fallback', 'no_today')
+        return []
+    except Exception as e:
+        print(f"[fallback] {symbol} error: {e}", flush=True)
+        _bump_fetch_stat('fallback', 'error')
+        return []
 
 
 # ============================================================
@@ -185,37 +401,33 @@ def save_kline(symbol, klines, table='kline_daily'):
     if not klines:
         return 0
     with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute('PRAGMA journal_mode=WAL')
-        c = conn.cursor()
+        conn = get_conn()
         count = 0
         for k in klines:
             try:
-                c.execute(f'''INSERT INTO {table}
-                    (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(symbol, trade_date) DO UPDATE SET
-                    open=excluded.open, close=excluded.close, high=excluded.high, low=excluded.low,
-                    volume=excluded.volume, amount=excluded.amount, chg=excluded.chg, chg_pct=excluded.chg_pct''',
+                _exec(conn, _upsert_kline_sql(table),
                     (symbol, k['trade_date'], k['open'], k['close'], k['high'], k['low'],
                      k['volume'], k['amount'], k['chg'], k['chg_pct']))
                 count += 1
-            except Exception as e:
+            except Exception:
                 pass
         conn.commit()
         conn.close()
     return count
+
 
 def save_valuation(symbol, quote):
     """保存估值数据（当日）"""
     if not quote or not quote.get('pe'):
         return 0
     with db_lock:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         try:
-            conn.execute('''INSERT OR REPLACE INTO daily_valuation
+            _exec(conn, '''INSERT INTO daily_valuation
                 (symbol, trade_date, pe_ttm, pb, ps_ttm)
-                VALUES (?,?,?,?,?)''',
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                pe_ttm=excluded.pe_ttm, pb=excluded.pb, ps_ttm=excluded.ps_ttm''',
                 (symbol, TODAY, quote['pe'], quote['pb'], None))
             conn.commit()
             conn.close()
@@ -233,24 +445,51 @@ def save_valuation(symbol, quote):
 def sync_daily_kline():
     log("=== [腾讯] 同步日K线 ===")
     completed, failed = 0, 0
+    stale = 0
+    wrote_today = 0
+    fallback_used = 0
 
     def process(sym):
-        nonlocal completed, failed
+        nonlocal completed, failed, stale, wrote_today, fallback_used
+        if not is_valid_symbol(sym):
+            stale += 1
+            return
         time.sleep(random.uniform(0.05, 0.15))
         klines = fetch_tencent_kline(sym, 'day')
+        has_today = any(str(k.get('trade_date')) == TODAY for k in klines) if klines else False
+
         if klines:
-            save_kline(sym, klines, 'kline_daily')
-            completed += 1
+            inserted = save_kline(sym, klines, 'kline_daily')
+            if has_today and inserted > 0:
+                completed += 1
+                wrote_today += 1
+                if (completed + failed + stale) % 1000 == 0:
+                    log(f'  日K线进度: {completed + failed + stale}/{len(stock_list)}')
+                return
+
+        fallback_rows = fetch_fallback_today_kline(sym)
+        if fallback_rows:
+            inserted_fb = save_kline(sym, fallback_rows, 'kline_daily')
+            if inserted_fb > 0:
+                completed += 1
+                wrote_today += 1
+                fallback_used += 1
+            else:
+                stale += 1 if klines else failed + 0
         else:
-            failed += 1
-        if (completed + failed) % 1000 == 0:
-            log(f'  日K线进度: {completed + failed}/{len(stock_list)}')
+            if klines:
+                stale += 1
+            else:
+                failed += 1
+
+        if (completed + failed + stale) % 1000 == 0:
+            log(f'  日K线进度: {completed + failed + stale}/{len(stock_list)}')
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(process, stock_list))
 
-    log(f'  日K线完成: 成功 {completed}, 失败 {failed}')
-    return completed, failed
+    log(f'  日K线完成: 今日成功 {completed}, 历史返回/未含今日 {stale}, 失败 {failed}, fallback补齐 {fallback_used}')
+    return completed, failed, stale
 
 
 # ============================================================
@@ -259,28 +498,6 @@ def sync_daily_kline():
 
 def sync_index_daily_kline():
     log("=== [腾讯] 同步指数日K线 ===")
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('''CREATE TABLE IF NOT EXISTS kline_daily_index (
-            symbol TEXT,
-            trade_date TEXT,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume REAL,
-            amount REAL,
-            pct_change REAL,
-            ma5 REAL,
-            ma10 REAL,
-            ma20 REAL,
-            rsi14 REAL,
-            PRIMARY KEY (symbol, trade_date)
-        )''')
-        conn.commit()
-        conn.close()
-
     completed, failed = 0, 0
     for sym in INDEX_SYMBOLS:
         klines = fetch_tencent_kline(sym, 'day')
@@ -288,12 +505,10 @@ def sync_index_daily_kline():
             failed += 1
             continue
         with db_lock:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute('PRAGMA journal_mode=WAL')
-            c = conn.cursor()
+            conn = get_conn()
             for k in klines:
                 try:
-                    c.execute('''INSERT INTO kline_daily_index
+                    _exec(conn, '''INSERT INTO kline_daily_index
                         (symbol, trade_date, open, high, low, close, volume, amount, pct_change)
                         VALUES (?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(symbol, trade_date) DO UPDATE SET
@@ -315,20 +530,20 @@ def sync_index_daily_kline():
 
 def recalc_index_technical_indicators():
     log("=== 重算指数技术指标 (MA/RSI) ===")
-    conn = sqlite3.connect(DB_PATH)
-    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily_index').fetchall()]
+    conn = get_conn()
+    symbols = [r[0] for r in _fetchall(_exec(conn, 'SELECT DISTINCT symbol FROM kline_daily_index'))]
 
     for symbol in symbols:
-        rows = conn.execute(
-            'SELECT rowid, close FROM kline_daily_index WHERE symbol=? ORDER BY trade_date',
+        rows = _fetchall(_exec(conn,
+            'SELECT trade_date, close FROM kline_daily_index WHERE symbol=? ORDER BY trade_date',
             (symbol,)
-        ).fetchall()
+        ))
         if len(rows) < 20:
             continue
 
         closes = [r[1] for r in rows]
         updates = []
-        for j, (rowid, close) in enumerate(rows):
+        for j, (trade_date, close) in enumerate(rows):
             ma5 = round(sum(closes[max(0, j-4):j+1]) / min(5, j+1), 2)
             ma10 = round(sum(closes[max(0, j-9):j+1]) / min(10, j+1), 2)
             ma20 = round(sum(closes[max(0, j-19):j+1]) / min(20, j+1), 2)
@@ -347,10 +562,10 @@ def recalc_index_technical_indicators():
                 else:
                     rs = avg_gain / avg_loss
                     rsi14 = round(100 - 100 / (1 + rs), 2)
-            updates.append((ma5, ma10, ma20, rsi14, rowid))
+            updates.append((ma5, ma10, ma20, rsi14, symbol, trade_date))
 
-        conn.executemany(
-            'UPDATE kline_daily_index SET ma5=?, ma10=?, ma20=?, rsi14=? WHERE rowid=?',
+        _execmany(conn,
+            'UPDATE kline_daily_index SET ma5=?, ma10=?, ma20=?, rsi14=? WHERE symbol=? AND trade_date=?',
             updates
         )
 
@@ -393,28 +608,28 @@ def sync_monthly_kline():
 
 def recalc_technical_indicators(target_date=None):
     log("=== 重算技术指标 (MA/RSI) ===")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
 
     # 增量模式：只处理目标日有K线的股票，并且只更新目标日这一行
     if target_date:
-        symbols = [r[0] for r in conn.execute(
+        symbols = [r[0] for r in _fetchall(_exec(conn,
             'SELECT DISTINCT symbol FROM kline_daily WHERE trade_date=?',
             (target_date,)
-        ).fetchall()]
+        ))]
         updated_rows = 0
 
         for i, symbol in enumerate(symbols, 1):
-            rows = conn.execute(
-                'SELECT rowid, trade_date, close FROM kline_daily WHERE symbol=? ORDER BY trade_date',
+            rows = _fetchall(_exec(conn,
+                'SELECT trade_date, close FROM kline_daily WHERE symbol=? ORDER BY trade_date',
                 (symbol,)
-            ).fetchall()
+            ))
             if len(rows) < 20:
                 continue
 
-            closes = [r[2] for r in rows]
+            closes = [r[1] for r in rows]
             updates = []
-            for j, (rowid, trade_date, close) in enumerate(rows):
-                if trade_date != target_date:
+            for j, (trade_date, close) in enumerate(rows):
+                if str(trade_date) != str(target_date):
                     continue
 
                 ma5 = round(sum(closes[max(0, j-4):j+1]) / min(5, j+1), 2)
@@ -437,11 +652,11 @@ def recalc_technical_indicators(target_date=None):
                         rs = avg_gain / avg_loss
                         rsi14 = round(100 - 100 / (1 + rs), 2)
 
-                    updates.append((ma5, ma10, ma20, ma60, rsi14, ma20, rowid))
+                updates.append((ma5, ma10, ma20, ma60, rsi14, ma20, symbol, trade_date))
 
             if updates:
-                conn.executemany(
-                    'UPDATE kline_daily SET ma5=?, ma10=?, ma20=?, ma60=?, rsi14=?, boll_mid=? WHERE rowid=?',
+                _execmany(conn,
+                    'UPDATE kline_daily SET ma5=?, ma10=?, ma20=?, ma60=?, rsi14=?, boll_mid=? WHERE symbol=? AND trade_date=?',
                     updates
                 )
                 updated_rows += len(updates)
@@ -455,30 +670,29 @@ def recalc_technical_indicators(target_date=None):
         log(f"  技术指标完成: 目标日 {target_date} 更新 {updated_rows} 行")
         return
 
-    # 兼容原有全量模式
-    symbols = [r[0] for r in conn.execute(
-        'SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    symbols = [r[0] for r in _fetchall(_exec(conn,
+        'SELECT DISTINCT symbol FROM kline_daily'
+    ))]
     updated = 0
 
     for i, symbol in enumerate(symbols):
-        rows = conn.execute(
-            'SELECT rowid, close, high, low FROM kline_daily WHERE symbol=? ORDER BY trade_date',
+        rows = _fetchall(_exec(conn,
+            'SELECT trade_date, close, high, low FROM kline_daily WHERE symbol=? ORDER BY trade_date',
             (symbol,)
-        ).fetchall()
+        ))
 
         if len(rows) < 20:
             continue
 
         closes = [r[1] for r in rows]
-
+        updates = []
         for j, row in enumerate(rows):
-            rowid = row[0]
+            trade_date = row[0]
             ma5 = round(sum(closes[max(0, j-4):j+1]) / min(5, j+1), 2) if j >= 0 else None
             ma10 = round(sum(closes[max(0, j-9):j+1]) / min(10, j+1), 2) if j >= 1 else None
             ma20 = round(sum(closes[max(0, j-19):j+1]) / min(20, j+1), 2) if j >= 1 else None
             ma60 = round(sum(closes[max(0, j-59):j+1]) / min(60, j+1), 2) if j >= 1 else None
 
-            # RSI14
             rsi14 = None
             if j >= 14:
                 gains, losses = [], []
@@ -494,9 +708,12 @@ def recalc_technical_indicators(target_date=None):
                     rs = avg_gain / avg_loss
                     rsi14 = round(100 - 100 / (1 + rs), 2)
 
-            conn.execute(
-                'UPDATE kline_daily SET ma5=?, ma10=?, ma20=?, ma60=?, rsi14=?, boll_mid=? WHERE rowid=?',
-                (ma5, ma10, ma20, ma60, rsi14, ma20, rowid)
+            updates.append((ma5, ma10, ma20, ma60, rsi14, ma20, symbol, trade_date))
+
+        if updates:
+            _execmany(conn,
+                'UPDATE kline_daily SET ma5=?, ma10=?, ma20=?, ma60=?, rsi14=?, boll_mid=? WHERE symbol=? AND trade_date=?',
+                updates
             )
 
         updated += 1
@@ -514,10 +731,8 @@ def recalc_technical_indicators(target_date=None):
 
 def sync_valuation():
     log("=== [腾讯] 同步估值数据 PE/PB ===")
-    conn = sqlite3.connect(DB_PATH)
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='daily_valuation'"
-    ).fetchall()]
+    conn = get_conn()
+    tables = _table_exists(conn, 'daily_valuation')
     conn.close()
     if not tables:
         log("  daily_valuation 表不存在，跳过")
@@ -527,8 +742,9 @@ def sync_valuation():
     batch_size = 50  # 腾讯支持批量查询
 
     for i in range(0, len(stock_list), batch_size):
-        batch = stock_list[i:i+batch_size]
-        # 构建批量查询
+        batch = [sym for sym in stock_list[i:i+batch_size] if is_valid_symbol(sym)]
+        if not batch:
+            continue
         query_str = ','.join(batch)
         session = _get_session()
         try:
@@ -547,14 +763,7 @@ def sync_valuation():
                         pe = float(fields[39]) if fields[39] else None
                         pb = float(fields[46]) if fields[46] else None
                         if pe and pb:
-                            with db_lock:
-                                _conn = sqlite3.connect(DB_PATH)
-                                _conn.execute('''INSERT OR REPLACE INTO daily_valuation
-                                    (symbol, trade_date, pe_ttm, pb, ps_ttm)
-                                    VALUES (?,?,?,?,?)''',
-                                    (sym, TODAY, pe, pb, None))
-                                _conn.commit()
-                                _conn.close()
+                            save_valuation(sym, {'pe': pe, 'pb': pb})
                             completed += 1
                 except:
                     pass
@@ -581,17 +790,13 @@ def sync_financial_indicators():
         log("  akshare 未安装，跳过财务指标")
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    # 检查是否有新的财报数据需要更新
-    # 简化版：只更新最近有财报发布的股票
-    symbols = [r[0] for r in conn.execute(
+    conn = get_conn()
+    symbols = [r[0] for r in _fetchall(_exec(conn,
         'SELECT DISTINCT symbol FROM kline_daily ORDER BY symbol'
-    ).fetchall()]
+    ))]
     conn.close()
 
     log(f"  待检查: {len(symbols)} 只（逐只检查是否有新财报）")
-    # 这部分逻辑比较复杂，保留原有 daily_sync.py 的实现
-    # 暂时标记为需要手动触发
     log("  财务指标同步暂需手动运行 daily_sync.py --fund")
 
 
@@ -620,26 +825,55 @@ def main():
         # 2. 指数日K线 + 指标
         sync_index_daily_kline()
 
-        # 3. 技术指标重算（增量模式：只补今天；全量模式：全量重算）
-        recalc_technical_indicators(TODAY if not args.full else None)
+        # 3. 技术指标重算
+        if args.full:
+            recalc_technical_indicators(None)
+        elif LIGHT_TARGET_DATE_MODE:
+            recalc_technical_indicators(TODAY)
+        else:
+            # 增量模式：至少重算今天；若今天数据不足，再补算最近有效交易日
+            recalc_targets = []
+            conn = get_conn()
+            try:
+                today_total = _fetchone(_exec(conn,
+                    'SELECT COUNT(*) FROM kline_daily WHERE trade_date=?',
+                    (TODAY,)
+                ))[0]
+                if today_total > 0:
+                    recalc_targets.append(TODAY)
+
+                fallback_date = get_latest_valid_trade_date(conn)
+                if fallback_date and fallback_date not in recalc_targets:
+                    # 当今天数据不足或不存在时，补算最近有效交易日，避免 daily_pick 回退后 RSI/MA 为空
+                    if today_total < MIN_STOCKS or fallback_date != TODAY:
+                        recalc_targets.append(fallback_date)
+            finally:
+                conn.close()
+
+            if not recalc_targets:
+                recalc_targets = [TODAY]
+
+            for target in recalc_targets:
+                recalc_technical_indicators(target)
 
         # 4. 周K线（--no-weekly 时跳过，仅周日全量跑）
-        if not args.no_weekly:
+        if not args.no_weekly and not LIGHT_TARGET_DATE_MODE:
             sync_weekly_kline()
 
         # 5. 月K线（--no-monthly 时跳过，仅周日全量跑）
-        if not args.no_monthly:
+        if not args.no_monthly and not LIGHT_TARGET_DATE_MODE:
             sync_monthly_kline()
 
         # 6. 估值数据
-        sync_valuation()
+        if not LIGHT_TARGET_DATE_MODE:
+            sync_valuation()
 
         # 7. 财务指标（仅全量或周末）
         if args.full:
             sync_financial_indicators()
 
-        # 8. 增量算今天布林带（必须在 READY_FLAG 之前完成）
-        _calc_today_bollinger()
+        # 8. 增量算目标日布林带（必须在 READY_FLAG 之前完成）
+        _calc_today_bollinger(TODAY)
 
         # 最终校验（布林带算完后再决定是否发就绪信号）
         ok, valid_date = post_sync_validate()
@@ -663,149 +897,166 @@ def main():
 # ============================================================
 # 今日布林带增量计算
 # ============================================================
-def _calc_today_bollinger():
-    """只计算今天有数据的股票的布林带（增量，速度快）"""
+def _calc_today_bollinger(target_date=None):
+    """只计算目标日有数据的股票的布林带（增量，速度快）"""
     import numpy as np
-    log("=== [腾讯] 增量计算今日布林带 ===")
-    conn = sqlite3.connect(DB_PATH)
-    today = TODAY
+    target_date = target_date or TODAY
+    log(f"=== [腾讯] 增量计算目标日布林带: {target_date} ===")
+    conn = get_conn()
 
-    # 找出今天有数据的股票
-    symbols = [r[0] for r in conn.execute(
+    symbols = [r[0] for r in _fetchall(_exec(conn,
         "SELECT DISTINCT symbol FROM kline_daily WHERE trade_date=?",
-        (today,)
-    ).fetchall()]
+        (target_date,)
+    ))]
 
     if not symbols:
         conn.close()
-        log("  今日无新数据，跳过")
+        log("  目标日无新数据，跳过")
         return
 
-    # 确保列存在
-    cols = [c[1] for c in conn.execute('PRAGMA table_info(kline_daily)').fetchall()]
-    for col in ['boll_lower', 'boll_upper']:
-        if col not in cols:
-            conn.execute(f'ALTER TABLE kline_daily ADD COLUMN {col} REAL')
-
     updated = 0
+    updated_rows = 0
     for sym in symbols:
-        rows = conn.execute(
-            'SELECT trade_date, close FROM kline_daily WHERE symbol=? ORDER BY trade_date DESC LIMIT 25',
-            (sym,)
-        ).fetchall()
+        rows = _fetchall(_exec(conn,
+            'SELECT trade_date, close FROM kline_daily WHERE symbol=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 25',
+            (sym, target_date)
+        ))
         rows.reverse()
         if len(rows) < 20:
             continue
 
         closes = [r[1] for r in rows]
         dates = [r[0] for r in rows]
+        if str(dates[-1]) != str(target_date):
+            continue
 
-        updates = []
-        for i in range(19, len(closes)):
-            window = closes[i-19:i+1]
-            ma20 = np.mean(window)
-            std20 = np.std(window, ddof=1)
-            upper = ma20 + 2 * std20
-            lower = ma20 - 2 * std20
-            updates.append((round(upper, 4), round(lower, 4), sym, dates[i]))
-
-        if updates:
-            conn.executemany(
-                'UPDATE kline_daily SET boll_upper=?, boll_lower=? WHERE symbol=? AND trade_date=?',
-                updates
-            )
-            updated += 1
+        window = closes[-20:]
+        ma20 = float(np.mean(window))
+        std20 = float(np.std(window, ddof=1))
+        upper = ma20 + 2 * std20
+        lower = ma20 - 2 * std20
+        _execmany(conn,
+            'UPDATE kline_daily SET boll_upper=?, boll_lower=? WHERE symbol=? AND trade_date=?',
+            [(float(round(upper, 4)), float(round(lower, 4)), sym, target_date)]
+        )
+        updated += 1
+        updated_rows += 1
 
     conn.commit()
     conn.close()
-    log(f"  今日布林带完成: {updated} 只股票")
+    log(f"  目标日布林带完成: 股票 {updated} 只, 行 {updated_rows}")
 
 
 # ============================================================
 # 同步后数据校验
 # ============================================================
+def _health_exec_factory(conn):
+    return lambda sql, params=None: conn.cursor().execute(sql, params) if False else _exec(conn, sql, params)
+
+
 def get_latest_valid_trade_date(conn, min_stocks=MIN_STOCKS, lookback_days=VALID_LOOKBACK_DAYS):
-    """返回最近一个“有效交易日”（K线>=min_stocks），找不到返回None"""
-    row = conn.execute(
-        f"""
-        SELECT trade_date, COUNT(*) AS cnt
-        FROM kline_daily
-        WHERE trade_date >= date('{TODAY}', '-{lookback_days} day')
-        GROUP BY trade_date
-        HAVING cnt >= {min_stocks}
-        ORDER BY trade_date DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    return row[0] if row else None
+    """返回最近一个“有效交易日”（共享逻辑）"""
+    if DB_IS_POSTGRES:
+        row = _fetchone(_exec(conn, '''
+            SELECT trade_date, COUNT(*) AS cnt
+            FROM kline_daily
+            WHERE trade_date >= (%s::date - (%s * INTERVAL '1 day'))
+            GROUP BY trade_date
+            HAVING COUNT(*) >= %s
+            ORDER BY trade_date DESC
+            LIMIT 1
+        ''', (TODAY, lookback_days, min_stocks)))
+        return row[0] if row else None
+    return find_best_trade_date(
+        _health_exec_factory(conn),
+        _fetchone,
+        TODAY,
+        DB_TARGET,
+        min_stocks=min_stocks,
+        lookback_days=lookback_days,
+    )
 
 
 def post_sync_validate():
-    """同步完成后校验数据完整性，发现异常立即告警。返回(True/False, valid_date)"""
+    """同步完成后校验数据完整性，优先校验今天；发现异常立即告警。返回(True/False, valid_date)"""
     log("=== 同步后数据校验 ===")
-    conn = sqlite3.connect(DB_PATH)
-    target_date = get_latest_valid_trade_date(conn)
+    conn = get_conn()
+
+    today_total = _fetchone(_exec(conn,
+        "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?",
+        (TODAY,)
+    ))[0]
+    fallback_used = False
+    if today_total >= MIN_STOCKS:
+        target_date = TODAY
+    else:
+        target_date = get_latest_valid_trade_date(conn)
+        fallback_used = bool(target_date and target_date != TODAY)
+        log(f"  ⚠️ 今日 {TODAY} 仅 {today_total} 只，回退到最近有效交易日 {target_date} 做参考校验")
 
     if not target_date:
         conn.close()
         msg = f"最近{VALID_LOOKBACK_DAYS}天无有效交易日（K线<={MIN_STOCKS}）"
         log(f"  ❌ 校验失败: {msg}")
+        write_sync_status({
+            'pipeline_stage': 'base',
+            'ready': False,
+            'today': TODAY,
+            'target_date': None,
+            'today_kline_count': today_total,
+            'fallback_used': False,
+            'validation_errors': [msg],
+            'validation_warnings': [],
+        })
         with open('/tmp/stock_sync_alert.txt', 'w') as f:
             f.write(f"{TODAY} sync failed:\n{msg}\n")
         return False, None
 
-    errors = []
-
-    # 1. 目标日K线数量
-    total = conn.execute(
-        "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?",
-        (target_date,)
-    ).fetchone()[0]
-    if total < MIN_STOCKS:
-        errors.append(f"K线数据不足: {target_date} {total}只（需≥{MIN_STOCKS}）")
-
-    # 2. 技术指标覆盖率
-    has_rsi = conn.execute(
-        "SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND rsi14 IS NOT NULL",
-        (target_date,)
-    ).fetchone()[0]
-    has_ma = conn.execute(
-        "SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND ma20 IS NOT NULL",
-        (target_date,)
-    ).fetchone()[0]
-    if total > 0 and has_rsi < total * 0.8:
-        errors.append(f"RSI未覆盖: {target_date} {has_rsi}/{total}只")
-    if total > 0 and has_ma < total * 0.8:
-        errors.append(f"MA20未覆盖: {target_date} {has_ma}/{total}只")
-
-    # 3. 上一有效交易日对比（检测数据量骤降）
-    prev = conn.execute(
-        """
-        SELECT trade_date, COUNT(*) AS cnt
-        FROM kline_daily
-        WHERE trade_date < ?
-        GROUP BY trade_date
-        HAVING cnt >= ?
-        ORDER BY trade_date DESC
-        LIMIT 1
-        """,
-        (target_date, MIN_STOCKS)
-    ).fetchone()
-    if prev and total < prev[1] * 0.9:
-        errors.append(f"数据量骤降: {target_date} {total}只 vs 上日{prev[0]} {prev[1]}只")
-
+    health = assess_trade_date_health(
+        _health_exec_factory(conn),
+        _fetchone,
+        TODAY,
+        target_date,
+        min_stocks=MIN_STOCKS,
+        db_target=DB_TARGET,
+    )
     conn.close()
 
-    summary = f"目标日{target_date}: K线{total}只, RSI{has_rsi}只, MA20{has_ma}只"
-    if errors:
+    summary = f"目标日{target_date}: K线{health['total']}只, RSI{health['rsi']}只, MA20{health['ma20']}只"
+    log(f"  FetchStats kline={FETCH_STATS.get('kline')} quote={FETCH_STATS.get('quote')}")
+    write_sync_status({
+        'pipeline_stage': 'base',
+        'ready': health['ok'],
+        'today': TODAY,
+        'target_date': target_date,
+        'today_kline_count': today_total,
+        'fallback_used': fallback_used,
+        'validation_errors': health['errors'],
+        'validation_warnings': health['warnings'],
+        'health': {
+            'total': health['total'],
+            'rsi': health['rsi'],
+            'ma20': health['ma20'],
+            'bb': health['bb'],
+            'valuation': health['valuation'],
+            'sh_count': health['sh_count'],
+            'sz_count': health['sz_count'],
+        },
+        'fetch_stats': FETCH_STATS,
+    })
+    if health['errors']:
         log(f"  ❌ 校验失败: {summary}")
-        for e in errors:
+        for e in health['errors']:
             log(f"    • {e}")
+        for w in health['warnings']:
+            log(f"    ⚠️ {w}")
         with open('/tmp/stock_sync_alert.txt', 'w') as f:
-            f.write(f"{TODAY} sync failed:\n" + '\n'.join(errors))
+            f.write(f"{TODAY} sync failed:\n" + '\n'.join(health['errors']))
         return False, target_date
     else:
         log(f"  ✅ 校验通过: {summary}")
+        for w in health['warnings']:
+            log(f"    ⚠️ {w}")
         try:
             os.remove('/tmp/stock_sync_alert.txt')
         except:

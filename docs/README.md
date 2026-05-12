@@ -31,6 +31,7 @@
 |------|------|
 | [crontab.md](ops/crontab.md) | 定时任务（每日20:30选股推送） |
 | [DEPLOY.md](DEPLOY.md) | 部署说明 |
+| [pg-migration-audit-2026-04-27.md](pg-migration-audit-2026-04-27.md) | PostgreSQL 迁移审计记录（主链已迁移/残留分级） |
 
 ---
 
@@ -82,6 +83,7 @@
 │
 ├── crontab.md (L3) ────────────────────→ 定时任务
 ├── DEPLOY.md (L3) ─────────────────────→ 部署
+├── pg-migration-audit-2026-04-27.md ──→ PG 迁移审计
 │
 └── deep_dive/ (L3) ───────────────────→ 系统深处
     ├── routes.md              — Flask 路由层

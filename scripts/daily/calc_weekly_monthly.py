@@ -9,65 +9,65 @@
   python3 calc_weekly_monthly.py --monthly-only
 """
 
-import sqlite3, argparse
+import os, sys, argparse
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-DB_PATH = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db'
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=60)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA synchronous=NORMAL')
-    return conn
+from db import DatabaseManager, _is_postgres_target
+
+DEFAULT_DB_PATH = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db'
+DB_TARGET = os.environ.get('POSTGRES_DSN') or os.environ.get('PG_DSN') or os.environ.get('DATABASE_URL') or os.environ.get('DB_DSN') or os.environ.get('STOCK_DB') or DEFAULT_DB_PATH
+DB_IS_POSTGRES = _is_postgres_target(DB_TARGET)
+
+db = DatabaseManager(DB_TARGET)
+
 
 def get_week_start(date_str):
-    """返回日期所在周的周一日期 'YYYY-MM-DD'"""
     d = datetime.strptime(date_str, '%Y-%m-%d')
     monday = d - timedelta(days=d.weekday())
     return monday.strftime('%Y-%m-%d')
 
-def calc_weekly(conn, weeks_back=52):
-    """从日K聚合生成周K"""
-    max_date = conn.execute("SELECT MAX(trade_date) FROM kline_daily").fetchone()[0]
+
+def execmany_raw(conn, sql, params_list):
+    cur = conn.cursor()
+    cur.executemany(sql.replace('?', '%s') if DB_IS_POSTGRES else sql, params_list)
+    return cur
+
+
+def calc_weekly(weeks_back=52):
+    row = db.fetch_one('SELECT MAX(trade_date) AS max_date FROM kline_daily')
+    max_date = row['max_date'] if row else None
     if not max_date:
-        print("日K数据为空，跳过周K计算")
+        print('日K数据为空，跳过周K计算')
         return 0
 
-    # 查最近N周涉及的所有日期范围
-    min_date = (datetime.strptime(max_date, '%Y-%m-%d') - timedelta(weeks=weeks_back)).strftime('%Y-%m-%d')
+    max_date = str(max_date)
+    min_date = (datetime.strptime(max_date[:10], '%Y-%m-%d') - timedelta(weeks=weeks_back)).strftime('%Y-%m-%d')
+    rows = db.fetch_all("""
+        SELECT symbol, trade_date, open, close, high, low, volume, amount
+        FROM kline_daily
+        WHERE trade_date >= ?
+        ORDER BY symbol, trade_date
+    """, (min_date,))
+    print(f'读取日K: {len(rows)} 条 (从 {min_date} 起)')
 
-    # 查出所有symbol+周的开/收/高/低/量
-    sql = """
-    SELECT 
-        symbol,
-        trade_date,
-        open,
-        close,
-        high,
-        low,
-        volume,
-        amount
-    FROM kline_daily
-    WHERE trade_date >= ?
-    ORDER BY symbol, trade_date
-    """
-    rows = conn.execute(sql, (min_date,)).fetchall()
-    print(f"读取日K: {len(rows)} 条 (从 {min_date} 起)")
-
-    # 按(symbol, 周一)聚合
     buckets = defaultdict(list)
     for r in rows:
-        if len(r) != 8:
-            print(f"  WARN: row len={len(r)} r={r}")
-            continue
-        symbol, trade_date, open_, close, high, low, volume, amount = r
-        week_start = get_week_start(trade_date)
-        buckets[(symbol, week_start)].append((trade_date, open_, close, high, low, volume, amount))
+        symbol = r['symbol']
+        trade_date = r['trade_date']
+        open_ = r['open']
+        close = r['close']
+        high = r['high']
+        low = r['low']
+        volume = r['volume']
+        amount = r['amount']
+        week_start = get_week_start(str(trade_date)[:10])
+        buckets[(symbol, week_start)].append((str(trade_date)[:10], open_, close, high, low, volume, amount))
 
-    # 生成周K
-    # bucket每条: (trade_date, open_, close, high, low, volume, amount)
-    # 索引:         0           1      2      3    4      5      6
     week_data = []
     for (symbol, week_start), days in buckets.items():
         days.sort(key=lambda x: x[0])
@@ -81,47 +81,44 @@ def calc_weekly(conn, weeks_back=52):
         chg_pct = (chg / first_open * 100) if first_open else 0
         week_data.append((symbol, week_start, first_open, last_close, high, low, volume, amount, chg, chg_pct))
 
-    print(f"生成周K: {len(week_data)} 条")
-    
-    # 写入（REPLACE）
-    conn.execute("DELETE FROM kline_weekly WHERE trade_week >= ?", (min_date,))
-    conn.executemany("""
-        INSERT INTO kline_weekly 
-        (symbol, trade_week, open, close, high, low, volume, amount, chg, chg_pct, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-    """, week_data)
-    conn.commit()
-    print(f"周K写入完成: {len(week_data)} 条")
+    print(f'生成周K: {len(week_data)} 条')
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(('DELETE FROM kline_weekly WHERE trade_week >= ?').replace('?', '%s') if DB_IS_POSTGRES else 'DELETE FROM kline_weekly WHERE trade_week >= ?', (min_date,))
+        execmany_raw(conn, """
+            INSERT INTO kline_weekly
+            (symbol, trade_week, open, close, high, low, volume, amount, chg, chg_pct, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, week_data)
+    print(f'周K写入完成: {len(week_data)} 条')
     return len(week_data)
 
-def calc_monthly(conn, months_back=24):
-    """从日K聚合生成月K"""
-    max_date = conn.execute("SELECT MAX(trade_date) FROM kline_daily").fetchone()[0]
+
+def calc_monthly(months_back=24):
+    row = db.fetch_one('SELECT MAX(trade_date) AS max_date FROM kline_daily')
+    max_date = row['max_date'] if row else None
     if not max_date:
-        print("日K数据为空，跳过月K计算")
+        print('日K数据为空，跳过月K计算')
         return 0
 
-    min_date = (datetime.strptime(max_date, '%Y-%m-%d') - timedelta(days=months_back * 31)).strftime('%Y-%m-%d')
+    max_date = str(max_date)
+    min_date = (datetime.strptime(max_date[:10], '%Y-%m-%d') - timedelta(days=months_back * 31)).strftime('%Y-%m-%d')
+    rows = db.fetch_all("""
+        SELECT symbol, trade_date, open, close, high, low, volume, amount
+        FROM kline_daily
+        WHERE trade_date >= ?
+        ORDER BY symbol, trade_date
+    """, (min_date,))
+    print(f'读取日K(月K用): {len(rows)} 条')
 
-    sql = """
-    SELECT symbol, trade_date, open, close, high, low, volume, amount
-    FROM kline_daily
-    WHERE trade_date >= ?
-    ORDER BY symbol, trade_date
-    """
-    rows = conn.execute(sql, (min_date,)).fetchall()
-    print(f"读取日K(月K用): {len(rows)} 条")
-
-    # 按(symbol, 月份)聚合
     buckets = defaultdict(list)
     for r in rows:
-        symbol, trade_date, open_, close, high, low, volume, amount = r
+        symbol = r['symbol']
+        trade_date = str(r['trade_date'])[:10]
         month_start = trade_date[:7] + '-01'
-        buckets[(symbol, month_start)].append((trade_date, open_, close, high, low, volume, amount))
+        buckets[(symbol, month_start)].append((trade_date, r['open'], r['close'], r['high'], r['low'], r['volume'], r['amount']))
 
     month_data = []
-    # bucket每条: (trade_date, open_, close, high, low, volume, amount)
-    # 索引:         0           1      2      3    4      5      6
     for (symbol, month_start), days in buckets.items():
         days.sort(key=lambda x: x[0])
         first_open = days[0][1]
@@ -134,17 +131,18 @@ def calc_monthly(conn, months_back=24):
         chg_pct = (chg / first_open * 100) if first_open else 0
         month_data.append((symbol, month_start[:7], first_open, last_close, high, low, volume, amount, chg, chg_pct))
 
-    print(f"生成月K: {len(month_data)} 条")
-    
-    conn.execute("DELETE FROM kline_monthly WHERE trade_month >= ?", (min_date[:7],))
-    conn.executemany("""
-        INSERT INTO kline_monthly 
-        (symbol, trade_month, open, close, high, low, volume, amount, chg, chg_pct, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-    """, month_data)
-    conn.commit()
-    print(f"月K写入完成: {len(month_data)} 条")
+    print(f'生成月K: {len(month_data)} 条')
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(('DELETE FROM kline_monthly WHERE trade_month >= ?').replace('?', '%s') if DB_IS_POSTGRES else 'DELETE FROM kline_monthly WHERE trade_month >= ?', (min_date[:7],))
+        execmany_raw(conn, """
+            INSERT INTO kline_monthly
+            (symbol, trade_month, open, close, high, low, volume, amount, chg, chg_pct, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, month_data)
+    print(f'月K写入完成: {len(month_data)} 条')
     return len(month_data)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -154,10 +152,8 @@ if __name__ == '__main__':
     parser.add_argument('--monthly-only', action='store_true')
     args = parser.parse_args()
 
-    conn = get_db()
     if not args.monthly_only:
-        calc_weekly(conn, args.weeks)
+        calc_weekly(args.weeks)
     if not args.weekly_only:
-        calc_monthly(conn, args.months)
-    conn.close()
-    print("完成")
+        calc_monthly(args.months)
+    print('完成')

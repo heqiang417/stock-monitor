@@ -1,0 +1,43 @@
+[project]
+name = "stock-monitor"
+version = "1.0.0"
+description = "A股量化选股监控系统 — 弱市反弹策略"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.1.0",
+    "flask-cors>=6.0.0",
+    "flask-socketio>=5.6.1",
+    "eventlet>=0.40.4",
+    "gunicorn>=22.0.0",
+    "requests>=2.32.0",
+    "numpy>=1.24.0",
+    "psycopg2-binary>=2.9.9",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+    "Pillow>=11.0.0",
+]
+
+[project.scripts]
+daily-pick = "scripts.daily.daily_pick_combined:main"
+daily-sync = "scripts.daily.daily_sync:main"
+evaluate = "scripts.evaluation.strategy_evaluator:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "models", "services", "routes", "utils"]

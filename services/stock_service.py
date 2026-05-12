@@ -5,7 +5,6 @@ Composes QuoteService and MarketDataService for focused responsibilities.
 """
 
 import time
-import sqlite3
 import logging
 import os
 import requests
@@ -15,7 +14,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from models.stock import StockQuote, StockHistory, KlineData, WatchlistItem, Sector, MarketIndex
-from db import DatabaseManager
+from db import DatabaseManager, _is_postgres_target
 from services.market_service import MarketDataService
 from services.quote_service import QuoteService
 
@@ -84,11 +83,78 @@ class StockService:
     # ==================== Database Operations ====================
     
     def init_db(self):
-        """Initialize SQLite database and create tables."""
-        with self._db.get_connection() as conn:
-            c = conn.cursor()
-            
-            c.execute('''
+        """Initialize application-owned tables required by the app."""
+        ddl_statements = []
+
+        if _is_postgres_target(self.db_path):
+            ddl_statements = [
+                '''
+                CREATE TABLE IF NOT EXISTS stock_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    timestamp BIGINT NOT NULL,
+                    price DOUBLE PRECISION NOT NULL,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    volume BIGINT,
+                    amount DOUBLE PRECISION,
+                    chg DOUBLE PRECISION,
+                    chg_pct DOUBLE PRECISION,
+                    bid1_price DOUBLE PRECISION,
+                    bid1_vol BIGINT,
+                    ask1_price DOUBLE PRECISION,
+                    ask1_vol BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                ''',
+                '''
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    symbol TEXT PRIMARY KEY,
+                    name TEXT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                ''',
+                '''
+                CREATE TABLE IF NOT EXISTS kline_weekly (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    trade_week TEXT NOT NULL,
+                    open DOUBLE PRECISION NOT NULL,
+                    close DOUBLE PRECISION NOT NULL,
+                    high DOUBLE PRECISION NOT NULL,
+                    low DOUBLE PRECISION NOT NULL,
+                    volume DOUBLE PRECISION,
+                    amount DOUBLE PRECISION,
+                    chg DOUBLE PRECISION,
+                    chg_pct DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, trade_week)
+                )
+                ''',
+                '''
+                CREATE TABLE IF NOT EXISTS kline_monthly (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    trade_month TEXT NOT NULL,
+                    open DOUBLE PRECISION NOT NULL,
+                    close DOUBLE PRECISION NOT NULL,
+                    high DOUBLE PRECISION NOT NULL,
+                    low DOUBLE PRECISION NOT NULL,
+                    volume DOUBLE PRECISION,
+                    amount DOUBLE PRECISION,
+                    chg DOUBLE PRECISION,
+                    chg_pct DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, trade_month)
+                )
+                ''',
+                'CREATE INDEX IF NOT EXISTS idx_kline_weekly_symbol ON kline_weekly(symbol)',
+                'CREATE INDEX IF NOT EXISTS idx_kline_monthly_symbol ON kline_monthly(symbol)',
+                'CREATE INDEX IF NOT EXISTS idx_stock_history_ts ON stock_history(timestamp)',
+            ]
+        else:
+            ddl_statements = [
+                '''
                 CREATE TABLE IF NOT EXISTS stock_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp INTEGER NOT NULL,
@@ -100,17 +166,15 @@ class StockService:
                     ask1_price REAL, ask1_vol INTEGER,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
-            
-            c.execute('''
+                ''',
+                '''
                 CREATE TABLE IF NOT EXISTS watchlist (
                     symbol TEXT PRIMARY KEY,
                     name TEXT,
                     added_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
-            
-            c.execute('''
+                ''',
+                '''
                 CREATE TABLE IF NOT EXISTS kline_daily (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -124,9 +188,8 @@ class StockService:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol, trade_date)
                 )
-            ''')
-            
-            c.execute('''
+                ''',
+                '''
                 CREATE TABLE IF NOT EXISTS kline_weekly (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -138,9 +201,8 @@ class StockService:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol, trade_week)
                 )
-            ''')
-            
-            c.execute('''
+                ''',
+                '''
                 CREATE TABLE IF NOT EXISTS kline_monthly (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -152,19 +214,20 @@ class StockService:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol, trade_month)
                 )
-            ''')
-            
-            # Indexes
-            for sql in [
+                ''',
                 'CREATE INDEX IF NOT EXISTS idx_kline_daily_symbol ON kline_daily(symbol)',
                 'CREATE INDEX IF NOT EXISTS idx_kline_daily_date ON kline_daily(trade_date)',
                 'CREATE INDEX IF NOT EXISTS idx_kline_weekly_symbol ON kline_weekly(symbol)',
                 'CREATE INDEX IF NOT EXISTS idx_kline_monthly_symbol ON kline_monthly(symbol)',
                 'CREATE INDEX IF NOT EXISTS idx_stock_history_ts ON stock_history(timestamp)',
                 'CREATE INDEX IF NOT EXISTS idx_kline_daily_symbol_date ON kline_daily(symbol, trade_date)',
-            ]:
+            ]
+
+        with self._db.get_connection() as conn:
+            c = conn.cursor()
+            for sql in ddl_statements:
                 c.execute(sql)
-        
+
         logger.info(f"Database initialized at {self.db_path}")
     
     def insert_stock_history(self, data: dict):
@@ -175,7 +238,7 @@ class StockService:
                 INSERT INTO stock_history 
                 (timestamp, price, open, high, low, volume, amount, chg, chg_pct, 
                  bid1_price, bid1_vol, ask1_price, ask1_vol)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ''', (
                 data.get('timestamp', int(time.time() * 1000)),
                 data.get('price', 0), data.get('open', 0),
@@ -201,8 +264,18 @@ class StockService:
     
     def add_to_watchlist(self, symbol: str, name: Optional[str] = None):
         """Add a stock to the watchlist."""
-        self._db.execute('INSERT OR REPLACE INTO watchlist (symbol, name, added_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
-                         (symbol, name or symbol))
+        if _is_postgres_target(self.db_path):
+            self._db.execute(
+                '''INSERT INTO watchlist (symbol, name, added_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT (symbol) DO UPDATE SET
+                     name = EXCLUDED.name,
+                     added_at = CURRENT_TIMESTAMP''',
+                (symbol, name or symbol)
+            )
+        else:
+            self._db.execute('INSERT OR REPLACE INTO watchlist (symbol, name, added_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
+                             (symbol, name or symbol))
         logger.info(f"Added {symbol} to watchlist")
     
     def remove_from_watchlist(self, symbol: str):
@@ -216,16 +289,42 @@ class StockService:
             c = conn.cursor()
             for row in kline_data:
                 try:
-                    c.execute('''
-                        INSERT OR REPLACE INTO kline_daily 
-                        (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct, ma5, ma10, ma20, ma60, rsi14)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        symbol, row.get('date'), row.get('open'), row.get('close'),
-                        row.get('high'), row.get('low'), row.get('volume'), row.get('amount', 0),
-                        row.get('chg', 0), row.get('chg_pct', 0),
-                        row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma60'), row.get('rsi')
-                    ))
+                    if _is_postgres_target(self.db_path):
+                        c.execute('''
+                            INSERT INTO kline_daily 
+                            (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct, ma5, ma10, ma20, ma60, rsi14)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (symbol, trade_date) DO UPDATE SET
+                                open = EXCLUDED.open,
+                                close = EXCLUDED.close,
+                                high = EXCLUDED.high,
+                                low = EXCLUDED.low,
+                                volume = EXCLUDED.volume,
+                                amount = EXCLUDED.amount,
+                                chg = EXCLUDED.chg,
+                                chg_pct = EXCLUDED.chg_pct,
+                                ma5 = EXCLUDED.ma5,
+                                ma10 = EXCLUDED.ma10,
+                                ma20 = EXCLUDED.ma20,
+                                ma60 = EXCLUDED.ma60,
+                                rsi14 = EXCLUDED.rsi14
+                        ''', (
+                            symbol, row.get('date'), row.get('open'), row.get('close'),
+                            row.get('high'), row.get('low'), row.get('volume'), row.get('amount', 0),
+                            row.get('chg', 0), row.get('chg_pct', 0),
+                            row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma60'), row.get('rsi')
+                        ))
+                    else:
+                        c.execute('''
+                            INSERT OR REPLACE INTO kline_daily 
+                            (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct, ma5, ma10, ma20, ma60, rsi14)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ''', (
+                            symbol, row.get('date'), row.get('open'), row.get('close'),
+                            row.get('high'), row.get('low'), row.get('volume'), row.get('amount', 0),
+                            row.get('chg', 0), row.get('chg_pct', 0),
+                            row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma60'), row.get('rsi')
+                        ))
                 except Exception as e:
                     logger.error(f"Error saving kline: {e}")
         logger.info(f"Saved {len(kline_data)} daily K-line records for {symbol}")
@@ -268,7 +367,7 @@ class StockService:
                 logger.info(f"Using cached K-line data for {symbol}: {len(cached)} records")
                 return cached
         
-        url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},{ktype},,,{num},qfq"
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get%sparam={symbol},{ktype},,,{num},qfq"
         headers = {
             'Referer': 'https://finance.qq.com',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -366,64 +465,63 @@ class StockService:
             return stock
         
         try:
-            with self._db.get_connection() as conn:
-                # Get latest K-line data with indicators
-                row = conn.execute(
-                    '''SELECT ma5, ma10, ma20, ma60, rsi14, volume 
-                       FROM kline_daily WHERE symbol=? ORDER BY trade_date DESC LIMIT 2''',
-                    (symbol,)
-                ).fetchall()
-                
-                if len(row) >= 1:
-                    latest = row[0]
-                    stock['ma5'] = latest[0]
-                    stock['ma10'] = latest[1]
-                    stock['ma20'] = latest[2]
-                    stock['ma60'] = latest[3]
-                    stock['rsi14'] = latest[4]
-                
-                if len(row) >= 2:
-                    prev = row[1]
-                    stock['ma5_prev'] = prev[0]
-                    stock['ma20_prev'] = prev[2]
-                
-                # Get latest financial indicators
-                fi = conn.execute(
-                    '''SELECT roe, eps, profit_growth, revenue_growth, debt_ratio, net_margin
-                       FROM financial_indicators WHERE symbol=? ORDER BY report_date DESC LIMIT 1''',
-                    (symbol,)
-                ).fetchone()
-                
-                if fi:
-                    stock['roe'] = fi[0]
-                    stock['eps'] = fi[1]
-                    stock['profit_growth'] = fi[2]
-                    stock['revenue_growth'] = fi[3]
-                    stock['debt_ratio'] = fi[4]
-                    stock['net_margin'] = fi[5]
-                
-                # Get latest capital flow
-                cf = conn.execute(
-                    '''SELECT main_net_inflow, super_large_net_inflow FROM capital_flow 
-                       WHERE symbol=? ORDER BY trade_date DESC LIMIT 1''',
-                    (symbol,)
-                ).fetchone()
-                
-                if cf:
-                    stock['main_net_inflow'] = cf[0] / 10000 if cf[0] else None  # 转万元
-                    stock['super_large_net_inflow'] = cf[1] / 10000 if cf[1] else None
-                
-                # 量比：当前成交量 / 30日均量
-                avg_vol = conn.execute(
-                    '''SELECT AVG(volume) FROM (
-                         SELECT volume FROM kline_daily WHERE symbol=? 
-                         ORDER BY trade_date DESC LIMIT 30
-                       )''',
-                    (symbol,)
-                ).fetchone()
-                current_vol = stock.get('volume')
-                if avg_vol and avg_vol[0] and current_vol:
-                    stock['volume_ratio'] = round(current_vol / avg_vol[0], 2)
+            # Get latest K-line data with indicators
+            row = self._db.fetch_all(
+                '''SELECT ma5, ma10, ma20, ma60, rsi14, volume 
+                   FROM kline_daily WHERE symbol=? ORDER BY trade_date DESC LIMIT 2''',
+                (symbol,)
+            )
+
+            if len(row) >= 1:
+                latest = row[0]
+                stock['ma5'] = latest['ma5']
+                stock['ma10'] = latest['ma10']
+                stock['ma20'] = latest['ma20']
+                stock['ma60'] = latest['ma60']
+                stock['rsi14'] = latest['rsi14']
+
+            if len(row) >= 2:
+                prev = row[1]
+                stock['ma5_prev'] = prev['ma5']
+                stock['ma20_prev'] = prev['ma20']
+
+            # Get latest financial indicators
+            fi = self._db.fetch_one(
+                '''SELECT roe, eps, profit_growth, revenue_growth, debt_ratio, net_margin
+                   FROM financial_indicators WHERE symbol=? ORDER BY report_date DESC LIMIT 1''',
+                (symbol,)
+            )
+
+            if fi:
+                stock['roe'] = fi['roe']
+                stock['eps'] = fi['eps']
+                stock['profit_growth'] = fi['profit_growth']
+                stock['revenue_growth'] = fi['revenue_growth']
+                stock['debt_ratio'] = fi['debt_ratio']
+                stock['net_margin'] = fi['net_margin']
+
+            # Get latest capital flow
+            cf = self._db.fetch_one(
+                '''SELECT main_net_inflow, super_large_net_inflow FROM capital_flow 
+                   WHERE symbol=? ORDER BY trade_date DESC LIMIT 1''',
+                (symbol,)
+            )
+
+            if cf:
+                stock['main_net_inflow'] = cf['main_net_inflow'] / 10000 if cf['main_net_inflow'] else None
+                stock['super_large_net_inflow'] = cf['super_large_net_inflow'] / 10000 if cf['super_large_net_inflow'] else None
+
+            # 量比：当前成交量 / 30日均量
+            avg_vol = self._db.fetch_one(
+                '''SELECT AVG(volume) AS avg_volume FROM (
+                     SELECT volume FROM kline_daily WHERE symbol=? 
+                     ORDER BY trade_date DESC LIMIT 30
+                   )''',
+                (symbol,)
+            )
+            current_vol = stock.get('volume')
+            if avg_vol and avg_vol['avg_volume'] and current_vol:
+                stock['volume_ratio'] = round(current_vol / avg_vol['avg_volume'], 2)
         except Exception as e:
             logger.debug(f"Enrich failed for {symbol}: {e}")
         

@@ -20,7 +20,6 @@
 import os
 import sys
 import json
-import sqlite3
 import time
 import random
 import argparse
@@ -28,7 +27,14 @@ import threading
 import subprocess
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 import numpy as np
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+from sync_health import write_sync_status
 
 # 添加项目根目录到 Python 路径（稳健解析：scripts/daily -> 项目根）
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +53,21 @@ if _project_root is None:
     # 最后兜底：保持旧行为，避免直接崩溃
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+env_file = os.path.join(_project_root, '.env')
+if os.path.exists(env_file):
+    try:
+        with open(env_file, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+    except Exception:
+        pass
+
 sys.path.insert(0, _project_root)
 
 # 兼容旧路径（仅作为fallback，优先使用当前项目路径）
@@ -59,6 +80,7 @@ from data_provider.tencent_fetcher import TencentFetcher
 from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.tushare_fetcher import TushareFetcher
 from data_provider.baostock_fetcher import BaostockFetcher
+from db import _is_postgres_target, _sqlite_placeholders_to_pyformat
 
 # akshare 内部请求会被系统代理(clash)阻断，在 import 前清除代理环境变量
 def _clear_proxy():
@@ -91,11 +113,20 @@ try:
 except Exception:
     pass
 
-DB_PATH = os.environ.get('STOCK_DB', os.path.join(_project_root, 'data', 'stock_data.db'))
+DB_TARGET = os.environ.get('POSTGRES_DSN') or os.environ.get('PG_DSN') or os.environ.get('DATABASE_URL') or os.environ.get('DB_DSN') or os.environ.get('STOCK_DB', os.path.join(_project_root, 'data', 'stock_data.db'))
+DB_PATH = DB_TARGET
+DB_IS_POSTGRES = _is_postgres_target(DB_TARGET)
 LOG_DIR = os.environ.get('SYNC_LOG_DIR', os.path.join(_project_root, 'logs'))
 INCR_DAYS = 15  # 增量更新天数
 DB_TIMEOUT = int(os.environ.get('STOCK_DB_TIMEOUT', '60'))
 DB_BUSY_TIMEOUT_MS = int(os.environ.get('STOCK_DB_BUSY_TIMEOUT_MS', '60000'))
+REQUIRE_PG = os.environ.get('REQUIRE_PG', '1') == '1'
+
+if REQUIRE_PG and not DB_IS_POSTGRES:
+    raise RuntimeError(
+        f"daily_sync.py requires PostgreSQL for production, but resolved DB_TARGET={DB_TARGET!r}. "
+        f"Remove SQLite STOCK_DB override or set POSTGRES_DSN/PG_DSN/DATABASE_URL."
+    )
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -103,12 +134,68 @@ today = datetime.now().strftime('%Y-%m-%d')
 log_file = os.path.join(LOG_DIR, f'sync_{today}.log')
 
 
+def _postgres_connect_kwargs(target: str) -> dict:
+    parsed = urlparse(target)
+    return {
+        'host': parsed.hostname or '127.0.0.1',
+        'port': parsed.port or 5432,
+        'user': parsed.username,
+        'password': parsed.password,
+        'dbname': parsed.path.lstrip('/'),
+        'connect_timeout': 10,
+    }
+
+
 def connect_db():
+    if DB_IS_POSTGRES:
+        import psycopg2
+        conn = psycopg2.connect(**_postgres_connect_kwargs(DB_TARGET))
+        conn.autocommit = False
+        return conn
+
+    from db import connect_db as _connect_db
     db_dir = os.path.dirname(DB_PATH) or '.'
     os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
-    conn.execute(f'PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}')
-    return conn
+    return _connect_db(DB_PATH)
+
+
+def _q(sql: str) -> str:
+    return _sqlite_placeholders_to_pyformat(sql) if DB_IS_POSTGRES else sql
+
+
+def db_execute(conn, sql: str, params=()):
+    cur = conn.cursor()
+    cur.execute(_q(sql), params)
+    return cur
+
+
+def db_executemany(conn, sql: str, params_list):
+    cur = conn.cursor()
+    cur.executemany(_q(sql), params_list)
+    return cur
+
+
+def db_fetchall(conn, sql: str, params=()):
+    return db_execute(conn, sql, params).fetchall()
+
+
+def db_fetchone(conn, sql: str, params=()):
+    return db_execute(conn, sql, params).fetchone()
+
+
+def sql_insert(table: str, columns: list[str], conflict_cols: list[str] | None = None, update_cols: list[str] | None = None, ignore: bool = False) -> str:
+    placeholders = ','.join(['?'] * len(columns))
+    cols = ', '.join(columns)
+    if ignore:
+        if conflict_cols:
+            return f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT ({', '.join(conflict_cols)}) DO NOTHING"
+        return f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})" if not DB_IS_POSTGRES else f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
+
+    if conflict_cols and update_cols:
+        update_clause = ', '.join(f"{c}=EXCLUDED.{c}" for c in update_cols)
+        return f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT ({', '.join(conflict_cols)}) DO UPDATE SET {update_clause}"
+
+    return f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
 
 def log(msg):
     ts = datetime.now().strftime('%H:%M:%S')
@@ -119,8 +206,11 @@ def log(msg):
 
 # 记录已注册的数据源
 log(f"已注册数据源: {[f.name for f in _manager.fetchers]}")
-log(f"数据库路径: {DB_PATH}")
-log(f"数据库目录存在: {os.path.isdir(os.path.dirname(DB_PATH) or '.')} | 文件存在: {os.path.exists(DB_PATH)} | timeout={DB_TIMEOUT}s | busy_timeout={DB_BUSY_TIMEOUT_MS}ms")
+log(f"数据库目标: {DB_TARGET}")
+if DB_IS_POSTGRES:
+    log("数据库类型: PostgreSQL")
+else:
+    log(f"数据库目录存在: {os.path.isdir(os.path.dirname(DB_PATH) or '.')} | 文件存在: {os.path.exists(DB_PATH)} | timeout={DB_TIMEOUT}s | busy_timeout={DB_BUSY_TIMEOUT_MS}ms")
 
 # ============================================================
 # 1. 日K线增量更新（多数据源自动切换）
@@ -128,7 +218,7 @@ log(f"数据库目录存在: {os.path.isdir(os.path.dirname(DB_PATH) or '.')} | 
 def sync_daily_kline():
     log("=== 开始同步日K线（多数据源）===")
     conn = connect_db()
-    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    symbols = [r[0] for r in db_fetchall(conn, 'SELECT DISTINCT symbol FROM kline_daily')]
     conn.close()
 
     beg_date = (datetime.now() - timedelta(days=INCR_DAYS)).strftime('%Y%m%d')
@@ -146,9 +236,12 @@ def sync_daily_kline():
             count = 0
             for _, row in df.iterrows():
                 try:
-                    conn2.execute('''INSERT OR REPLACE INTO kline_daily
-                        (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                    db_execute(conn2, sql_insert(
+                        'kline_daily',
+                        ['symbol', 'trade_date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'chg', 'chg_pct'],
+                        conflict_cols=['symbol', 'trade_date'],
+                        update_cols=['open', 'close', 'high', 'low', 'volume', 'amount', 'chg', 'chg_pct']
+                    ),
                         (symbol, str(row['date']), float(row['open']), float(row['close']),
                          float(row['high']), float(row['low']), float(row['volume']),
                          float(row['amount']), float(row.get('chg', 0)),
@@ -184,14 +277,15 @@ def sync_daily_kline():
 def recalc_technical_indicators():
     log("=== 重算技术指标 ===")
     conn = connect_db()
-    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    symbols = [r[0] for r in db_fetchall(conn, 'SELECT DISTINCT symbol FROM kline_daily')]
     updated = 0
 
     for i, symbol in enumerate(symbols):
-        rows = conn.execute(
-            'SELECT rowid, close, high, low FROM kline_daily WHERE symbol=? ORDER BY trade_date',
+        rows = db_fetchall(
+            conn,
+            'SELECT trade_date, close, high, low FROM kline_daily WHERE symbol=? ORDER BY trade_date',
             (symbol,)
-        ).fetchall()
+        )
 
         if len(rows) < 20:
             continue
@@ -200,15 +294,14 @@ def recalc_technical_indicators():
         highs = [r[2] for r in rows]
         lows = [r[3] for r in rows]
 
-        # 计算 MA
+        updates = []
         for j, row in enumerate(rows):
-            rowid = row[0]
+            trade_date = row[0]
             ma5 = round(sum(closes[max(0, j-4):j+1]) / min(5, j+1), 2) if j >= 0 else None
             ma10 = round(sum(closes[max(0, j-9):j+1]) / min(10, j+1), 2) if j >= 1 else None
             ma20 = round(sum(closes[max(0, j-19):j+1]) / min(20, j+1), 2) if j >= 1 else None
             ma60 = round(sum(closes[max(0, j-59):j+1]) / min(60, j+1), 2) if j >= 1 else None
 
-            # RSI14
             rsi14 = None
             if j >= 14:
                 gains, losses = [], []
@@ -224,9 +317,13 @@ def recalc_technical_indicators():
                     rs = avg_gain / avg_loss
                     rsi14 = round(100 - 100 / (1 + rs), 2)
 
-            conn.execute(
-                'UPDATE kline_daily SET ma5=?, ma10=?, ma20=?, ma60=?, rsi14=? WHERE rowid=?',
-                (ma5, ma10, ma20, ma60, rsi14, rowid)
+            updates.append((ma5, ma10, ma20, ma60, rsi14, symbol, trade_date))
+
+        if updates:
+            db_executemany(
+                conn,
+                'UPDATE kline_daily SET ma5=?, ma10=?, ma20=?, ma60=?, rsi14=? WHERE symbol=? AND trade_date=?',
+                updates
             )
 
         updated += 1
@@ -249,18 +346,18 @@ def sync_financial_indicators():
         return
 
     conn = connect_db()
-    all_symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    all_symbols = [r[0] for r in db_fetchall(conn, 'SELECT DISTINCT symbol FROM kline_daily')]
 
     # 找出最久没更新的500只
-    stale = conn.execute('''
+    stale = db_fetchall(conn, '''
         SELECT k.symbol FROM kline_daily k
         LEFT JOIN (
             SELECT symbol, MAX(report_date) as latest FROM financial_indicators GROUP BY symbol
         ) f ON k.symbol = f.symbol
-        GROUP BY k.symbol
+        GROUP BY k.symbol, f.latest
         ORDER BY COALESCE(f.latest, '2000-01-01') ASC
         LIMIT 500
-    ''').fetchall()
+    ''')
     symbols = [r[0] for r in stale]
     conn.close()
 
@@ -277,10 +374,13 @@ def sync_financial_indicators():
                 continue
             latest = df.iloc[0]
             conn2 = connect_db()
-            conn2.execute('''INSERT OR REPLACE INTO financial_indicators
-                (symbol, report_date, eps, roe, revenue_growth, profit_growth,
-                 gross_margin, net_margin, debt_ratio, current_ratio, total_assets)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            db_execute(conn2, sql_insert(
+                'financial_indicators',
+                ['symbol', 'report_date', 'eps', 'roe', 'revenue_growth', 'profit_growth',
+                 'gross_margin', 'net_margin', 'debt_ratio', 'current_ratio', 'total_assets'],
+                conflict_cols=['symbol', 'report_date'],
+                update_cols=['eps', 'roe', 'revenue_growth', 'profit_growth', 'gross_margin', 'net_margin', 'debt_ratio', 'current_ratio', 'total_assets']
+            ),
                 (symbol, str(latest.get('日期', '')),
                  float(latest.get('摊薄每股收益(元)', 0) or 0),
                  float(latest.get('净资产收益率(%)', 0) or 0),
@@ -312,7 +412,7 @@ def build_financial_daily():
     conn = connect_db()
 
     # 建表
-    conn.execute('''CREATE TABLE IF NOT EXISTS financial_daily (
+    db_execute(conn, '''CREATE TABLE IF NOT EXISTS financial_daily (
         symbol TEXT NOT NULL,
         trade_date TEXT NOT NULL,
         eps REAL, roe REAL, revenue_growth REAL, profit_growth REAL,
@@ -322,11 +422,11 @@ def build_financial_daily():
     )''')
 
     # 删除今天的旧快照（允许重跑）
-    conn.execute(f"DELETE FROM financial_daily WHERE trade_date='{today}'")
+    db_execute(conn, "DELETE FROM financial_daily WHERE trade_date=?", (today,))
 
     # 每只股票取最新一条财务数据，写入今天的快照
-    conn.execute(f'''
-        INSERT OR IGNORE INTO financial_daily
+    db_execute(conn, f'''
+        INSERT INTO financial_daily
             (symbol, trade_date, eps, roe, revenue_growth, profit_growth,
              gross_margin, net_margin, debt_ratio, current_ratio, total_assets)
         SELECT f.symbol, '{today}', f.eps, f.roe, f.revenue_growth, f.profit_growth,
@@ -336,9 +436,10 @@ def build_financial_daily():
             SELECT symbol, MAX(report_date) as max_date
             FROM financial_indicators GROUP BY symbol
         ) latest ON f.symbol = latest.symbol AND f.report_date = latest.max_date
+        ON CONFLICT (symbol, trade_date) DO NOTHING
     ''')
 
-    count = conn.execute(f"SELECT COUNT(*) FROM financial_daily WHERE trade_date='{today}'").fetchone()[0]
+    count = db_fetchone(conn, "SELECT COUNT(*) FROM financial_daily WHERE trade_date=?", (today,))[0]
     conn.commit()
     conn.close()
     log(f"  财务快照完成: {today} {count}只")
@@ -350,7 +451,7 @@ def sync_weekly_kline():
     log("=== 同步周K线（多数据源自动切换）===")
 
     conn = connect_db()
-    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    symbols = [r[0] for r in db_fetchall(conn, 'SELECT DISTINCT symbol FROM kline_daily')]
 
     start_date = (datetime.now() - timedelta(days=60)).strftime('%Y%m%d')
     end_date = datetime.now().strftime('%Y%m%d')
@@ -361,9 +462,12 @@ def sync_weekly_kline():
             df = _manager.get_period_data(symbol, start_date, end_date, period='weekly')
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
-                    conn.execute('''INSERT OR IGNORE INTO kline_weekly
-                        (symbol, trade_week, open, close, high, low, volume, amount, chg, chg_pct)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                    db_execute(conn, sql_insert(
+                        'kline_weekly',
+                        ['symbol', 'trade_week', 'open', 'close', 'high', 'low', 'volume', 'amount', 'chg', 'chg_pct'],
+                        conflict_cols=['symbol', 'trade_week'],
+                        ignore=True
+                    ),
                         (symbol, str(row['date']), float(row['open']), float(row['close']),
                          float(row['high']), float(row['low']), float(row['volume']),
                          float(row['amount']), float(row.get('chg', 0)),
@@ -388,7 +492,7 @@ def sync_monthly_kline():
     log("=== 同步月K线（多数据源自动切换）===")
 
     conn = connect_db()
-    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    symbols = [r[0] for r in db_fetchall(conn, 'SELECT DISTINCT symbol FROM kline_daily')]
 
     start_date = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
     end_date = datetime.now().strftime('%Y%m%d')
@@ -399,9 +503,12 @@ def sync_monthly_kline():
             df = _manager.get_period_data(symbol, start_date, end_date, period='monthly')
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
-                    conn.execute('''INSERT OR IGNORE INTO kline_monthly
-                        (symbol, trade_month, open, close, high, low, volume, amount, chg, chg_pct)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                    db_execute(conn, sql_insert(
+                        'kline_monthly',
+                        ['symbol', 'trade_month', 'open', 'close', 'high', 'low', 'volume', 'amount', 'chg', 'chg_pct'],
+                        conflict_cols=['symbol', 'trade_month'],
+                        ignore=True
+                    ),
                         (symbol, str(row['date']), float(row['open']), float(row['close']),
                          float(row['high']), float(row['low']), float(row['volume']),
                          float(row['amount']), float(row.get('chg', 0)),
@@ -434,7 +541,7 @@ def sync_valuation():
         return
 
     conn = connect_db()
-    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    symbols = [r[0] for r in db_fetchall(conn, 'SELECT DISTINCT symbol FROM kline_daily')]
 
     def _get_session():
         s = requests.Session()
@@ -469,8 +576,12 @@ def sync_valuation():
         quote = _fetch_tencent_quote(symbol)
         if quote and (quote.get('pe') is not None or quote.get('pb') is not None):
             try:
-                conn.execute('''INSERT OR REPLACE INTO daily_valuation
-                    (symbol, trade_date, pe_ttm, pb, ps_ttm) VALUES (?,?,?,?,?)''',
+                db_execute(conn, sql_insert(
+                    'daily_valuation',
+                    ['symbol', 'trade_date', 'pe_ttm', 'pb', 'ps_ttm'],
+                    conflict_cols=['symbol', 'trade_date'],
+                    update_cols=['pe_ttm', 'pb', 'ps_ttm']
+                ),
                     (symbol, today, quote.get('pe'), quote.get('pb'), None))
                 count += 1
             except Exception:
@@ -490,8 +601,24 @@ def sync_valuation():
 def sync_capital_flow():
     """资金流向当前数据源不稳定，先止血：不再长时间卡死或写入异常稀疏数据。"""
     log("=== 同步资金流向（降级保护）===")
+    latest = None
+    count = 0
+    try:
+        conn = connect_db()
+        latest = db_fetchone(conn, "SELECT MAX(trade_date) FROM capital_flow")[0]
+        if latest:
+            count = db_fetchone(conn, "SELECT COUNT(*) FROM capital_flow WHERE trade_date=?", (latest,))[0]
+        conn.close()
+    except Exception:
+        pass
     log("  ⚠️ 当前 eastmoney push2 链路不稳定，资金流同步暂时跳过，保留历史数据")
     log("  ⚠️ 待切换稳定替代数据源后再恢复日更")
+    return {
+        'status': 'degraded',
+        'reason': 'eastmoney_push2_unstable',
+        'latest_available_date': latest,
+        'latest_count': count,
+    }
 
 # ============================================================
 # 8. 行业板块更新
@@ -505,7 +632,7 @@ def sync_industry():
         return
 
     conn = connect_db()
-    symbols = [r[0] for r in conn.execute('SELECT DISTINCT symbol FROM kline_daily').fetchall()]
+    symbols = [r[0] for r in db_fetchall(conn, 'SELECT DISTINCT symbol FROM kline_daily')]
 
     # 尝试批量获取
     try:
@@ -523,8 +650,12 @@ def sync_industry():
                 else:
                     continue
                 if symbol in symbols:
-                    conn.execute('''INSERT OR REPLACE INTO stock_industry
-                        (symbol, industry, industry_code) VALUES (?,?,?)''',
+                    db_execute(conn, sql_insert(
+                        'stock_industry',
+                        ['symbol', 'industry', 'industry_code'],
+                        conflict_cols=['symbol'],
+                        update_cols=['industry', 'industry_code']
+                    ),
                         (symbol, str(row.get('名称', '')), str(row.get('代码', ''))))
                     count += 1
             conn.commit()
@@ -544,8 +675,12 @@ def sync_industry():
                 info = dict(zip(df['item'], df['value']))
                 industry = info.get('行业', '')
                 if industry:
-                    conn.execute('''INSERT OR REPLACE INTO stock_industry
-                        (symbol, industry) VALUES (?,?)''', (symbol, industry))
+                    db_execute(conn, sql_insert(
+                        'stock_industry',
+                        ['symbol', 'industry'],
+                        conflict_cols=['symbol'],
+                        update_cols=['industry']
+                    ), (symbol, industry))
                     success += 1
         except:
             pass
@@ -571,7 +706,9 @@ def sync_northbound_flow():
     _clear_proxy()
     conn = connect_db()
     # 检查已有最新日期
-    latest = conn.execute("SELECT MAX(date) FROM northbound_flow").fetchone()[0]
+    latest = db_fetchone(conn, "SELECT MAX(date) FROM northbound_flow")[0]
+    if latest and not isinstance(latest, str):
+        latest = str(latest)
     conn.close()
 
     count = 0
@@ -589,8 +726,12 @@ def sync_northbound_flow():
                 d = str(row.get('date', ''))
                 if latest and d <= latest:
                     continue
-                conn2.execute('''INSERT OR IGNORE INTO northbound_flow
-                    (date, type, direction, net_buy, net_flow, index_chg) VALUES (?,?,?,?,?,?)''',
+                db_execute(conn2, sql_insert(
+                    'northbound_flow',
+                    ['date', 'type', 'direction', 'net_buy', 'net_flow', 'index_chg'],
+                    conflict_cols=['date', 'type', 'direction'],
+                    ignore=True
+                ),
                     (d, name, '北向',
                      float(row.get('net_buy', 0) or 0),
                      float(row.get('net_flow', 0) or 0),
@@ -616,7 +757,9 @@ def sync_margin_data():
 
     _clear_proxy()
     conn = connect_db()
-    latest = conn.execute("SELECT MAX(date) FROM margin_data").fetchone()[0]
+    latest = db_fetchone(conn, "SELECT MAX(date) FROM margin_data")[0]
+    if latest and not isinstance(latest, str):
+        latest = latest.strftime('%Y%m%d') if hasattr(latest, 'strftime') else str(latest).replace('-', '')
     conn.close()
 
     # 最近7个自然日内取交易日候选
@@ -665,9 +808,12 @@ def sync_margin_data():
                 short_volume = _sum_col(df, ['融券余量'])
 
                 conn2 = connect_db()
-                conn2.execute('''INSERT OR REPLACE INTO margin_data
-                    (date, margin_balance, margin_buy, short_volume, short_amount,
-                     short_sell, total_balance) VALUES (?,?,?,?,?,?,?)''',
+                db_execute(conn2, sql_insert(
+                    'margin_data',
+                    ['date', 'margin_balance', 'margin_buy', 'short_volume', 'short_amount', 'short_sell', 'total_balance'],
+                    conflict_cols=['date'],
+                    update_cols=['margin_balance', 'margin_buy', 'short_volume', 'short_amount', 'short_sell', 'total_balance']
+                ),
                     (date_str, margin_balance, margin_buy, short_volume,
                      short_amount, short_sell, margin_balance + short_amount))
                 conn2.commit()
@@ -706,15 +852,15 @@ def sync_shareholder_data(limit=500):
 
     conn = connect_db()
     # 找出最久没更新的 limit 只
-    stale = conn.execute(f'''
+    stale = db_fetchall(conn, f'''
         SELECT k.symbol FROM kline_daily k
         LEFT JOIN (
             SELECT symbol, MAX(created_at) as latest FROM shareholder_data GROUP BY symbol
         ) s ON k.symbol = s.symbol
-        GROUP BY k.symbol
+        GROUP BY k.symbol, s.latest
         ORDER BY COALESCE(s.latest, '2000-01-01') ASC
         LIMIT {int(limit)}
-    ''').fetchall()
+    ''')
     symbols = [r[0] for r in stale]
     conn.close()
 
@@ -735,9 +881,12 @@ def sync_shareholder_data(limit=500):
                         name = str(row.get('股东名称', ''))
                         hold_num = float(row.get('持股数量', 0) or 0)
                         hold_ratio = float(row.get('持股比例', 0) or 0)
-                        conn2.execute('''INSERT OR IGNORE INTO shareholder_data
-                            (symbol, report_date, name, shareholder_count,
-                             change_pct, avg_holdings) VALUES (?,?,?,?,?,?)''',
+                        db_execute(conn2, sql_insert(
+                            'shareholder_data',
+                            ['symbol', 'report_date', 'name', 'shareholder_count', 'change_pct', 'avg_holdings'],
+                            conflict_cols=['symbol', 'report_date', 'name'],
+                            ignore=True
+                        ),
                             (symbol, rd, name, int(hold_num), hold_ratio, 0))
                         count += 1
                     conn2.commit()
@@ -766,7 +915,7 @@ def sync_limit_up_down():
         return
 
     conn = connect_db()
-    latest = conn.execute("SELECT MAX(date) FROM limit_up_down").fetchone()[0]
+    latest = db_fetchone(conn, "SELECT MAX(date) FROM limit_up_down")[0]
     conn.close()
 
     # 最近5个交易日
@@ -793,11 +942,14 @@ def sync_limit_up_down():
                 conn2 = connect_db()
                 for _, row in df.iterrows():
                     code = str(row.get('代码', ''))
-                    conn2.execute('''INSERT OR IGNORE INTO limit_up_down
-                        (date, code, name, chg_pct, close, amount, mkt_cap,
-                         turnover, seal_amount, first_seal_time, last_seal_time,
-                         break_count, consecutive, industry, type)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    db_execute(conn2, sql_insert(
+                        'limit_up_down',
+                        ['date', 'code', 'name', 'chg_pct', 'close', 'amount', 'mkt_cap',
+                         'turnover', 'seal_amount', 'first_seal_time', 'last_seal_time',
+                         'break_count', 'consecutive', 'industry', 'type'],
+                        conflict_cols=['date', 'code', 'type'],
+                        ignore=True
+                    ),
                         (date_str, code, str(row.get('名称', '')),
                          float(row.get('涨跌幅', 0) or 0),
                          float(row.get('最新价', 0) or 0),
@@ -823,10 +975,12 @@ def sync_limit_up_down():
                 conn2 = connect_db()
                 for _, row in df.iterrows():
                     code = str(row.get('代码', ''))
-                    conn2.execute('''INSERT OR IGNORE INTO limit_up_down
-                        (date, code, name, chg_pct, close, amount, mkt_cap,
-                         turnover, type)
-                        VALUES (?,?,?,?,?,?,?,?,?)''',
+                    db_execute(conn2, sql_insert(
+                        'limit_up_down',
+                        ['date', 'code', 'name', 'chg_pct', 'close', 'amount', 'mkt_cap', 'turnover', 'type'],
+                        conflict_cols=['date', 'code', 'type'],
+                        ignore=True
+                    ),
                         (date_str, code, str(row.get('名称', '')),
                          float(row.get('涨跌幅', 0) or 0),
                          float(row.get('最新价', 0) or 0),
@@ -865,7 +1019,7 @@ def sync_news():
 
     conn = connect_db()
     # 建表
-    conn.execute('''CREATE TABLE IF NOT EXISTS news_daily (
+    db_execute(conn, '''CREATE TABLE IF NOT EXISTS news_daily (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL,
         title TEXT,
@@ -877,7 +1031,7 @@ def sync_news():
     )''')
 
     # 读取关注列表
-    watchlist = conn.execute("SELECT symbol, name FROM watchlist").fetchall()
+    watchlist = db_fetchall(conn, "SELECT symbol, name FROM watchlist")
     conn.close()
 
     if not watchlist:
@@ -961,7 +1115,7 @@ def sync_market_review():
         return
 
     conn = connect_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS market_review (
+    db_execute(conn, '''CREATE TABLE IF NOT EXISTS market_review (
         trade_date TEXT PRIMARY KEY,
         index_data TEXT,
         up_count INTEGER,
@@ -999,23 +1153,24 @@ def sync_market_review():
         # 2. 涨跌统计（从数据库计算，依赖日K线数据）
         try:
             # 用最近一个有足够数据的交易日（排除今天，今天16:05后才有数据）
-            check_date = conn.execute(
+            check_date = db_fetchone(
+                conn,
                 "SELECT trade_date FROM kline_daily WHERE trade_date < ? "
                 "GROUP BY trade_date "
                 "HAVING COUNT(*) > 4000 ORDER BY trade_date DESC LIMIT 1",
                 (today_str,)
-            ).fetchone()
+            )
             if check_date:
                 review_date = check_date[0]
-                stats = conn.execute(f'''
+                stats = db_fetchone(conn, '''
                     SELECT 
                         SUM(CASE WHEN CAST(chg_pct AS REAL) > 0 THEN 1 ELSE 0 END),
                         SUM(CASE WHEN CAST(chg_pct AS REAL) < 0 THEN 1 ELSE 0 END),
                         SUM(CASE WHEN CAST(chg_pct AS REAL) = 0 THEN 1 ELSE 0 END),
                         SUM(CASE WHEN CAST(chg_pct AS REAL) >= 9.9 THEN 1 ELSE 0 END),
                         SUM(CASE WHEN CAST(chg_pct AS REAL) <= -9.9 THEN 1 ELSE 0 END)
-                    FROM kline_daily WHERE trade_date = '{review_date}'
-                ''').fetchone()
+                    FROM kline_daily WHERE trade_date = ?
+                ''', (review_date,))
                 up_count, down_count, flat_count, limit_up, limit_down = stats
                 today_str = review_date
             else:
@@ -1041,10 +1196,13 @@ def sync_market_review():
             log(f"  板块数据失败: {e}")
 
         # 写入数据库
-        conn.execute('''INSERT OR REPLACE INTO market_review
-            (trade_date, index_data, up_count, down_count, flat_count,
-             limit_up, limit_down, top_sectors, bottom_sectors)
-            VALUES (?,?,?,?,?,?,?,?,?)''',
+        db_execute(conn, sql_insert(
+            'market_review',
+            ['trade_date', 'index_data', 'up_count', 'down_count', 'flat_count',
+             'limit_up', 'limit_down', 'top_sectors', 'bottom_sectors'],
+            conflict_cols=['trade_date'],
+            update_cols=['index_data', 'up_count', 'down_count', 'flat_count', 'limit_up', 'limit_down', 'top_sectors', 'bottom_sectors']
+        ),
             (review_date, json.dumps(index_data, ensure_ascii=False),
              up_count, down_count, flat_count, limit_up, limit_down,
              json.dumps(top_sectors, ensure_ascii=False),
@@ -1137,7 +1295,7 @@ def sync_chip_distribution():
         return
 
     conn = connect_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS chip_distribution (
+    db_execute(conn, '''CREATE TABLE IF NOT EXISTS chip_distribution (
         symbol TEXT NOT NULL,
         trade_date TEXT NOT NULL,
         chip_data TEXT,
@@ -1149,7 +1307,7 @@ def sync_chip_distribution():
     )''')
 
     # 读取关注列表
-    watchlist = conn.execute("SELECT symbol, name FROM watchlist").fetchall()
+    watchlist = db_fetchall(conn, "SELECT symbol, name FROM watchlist")
     conn.close()
 
     if not watchlist:
@@ -1189,10 +1347,12 @@ def sync_chip_distribution():
                 conc_70 = float(last.get('70集中度', last.get('concentration_70', 0)) or 0)
 
             conn2 = connect_db()
-            conn2.execute('''INSERT OR REPLACE INTO chip_distribution
-                (symbol, trade_date, chip_data, avg_cost, profit_ratio,
-                 concentration_90, concentration_70)
-                VALUES (?,?,?,?,?,?,?)''',
+            db_execute(conn2, sql_insert(
+                'chip_distribution',
+                ['symbol', 'trade_date', 'chip_data', 'avg_cost', 'profit_ratio', 'concentration_90', 'concentration_70'],
+                conflict_cols=['symbol', 'trade_date'],
+                update_cols=['chip_data', 'avg_cost', 'profit_ratio', 'concentration_90', 'concentration_70']
+            ),
                 (symbol, today_str, json.dumps(chip_rows, ensure_ascii=False, default=str),
                  avg_cost, profit_ratio, conc_90, conc_70))
             conn2.commit()
@@ -1235,9 +1395,13 @@ def sync_index_kline():
                 log(f"  {name}({symbol}): 无数据")
                 continue
 
-            latest = conn.execute(
+            latest = db_fetchone(
+                conn,
                 "SELECT MAX(trade_date) FROM kline_daily_index WHERE symbol=?",
-                (symbol,)).fetchone()[0]
+                (symbol,)
+            )[0]
+            if latest and not isinstance(latest, str):
+                latest = str(latest)
 
             count = 0
             for _, row in df.iterrows():
@@ -1247,17 +1411,22 @@ def sync_index_kline():
 
                 close = float(row.get('close', 0) or 0)
                 prev_close = None
-                prev = conn.execute(
+                prev = db_fetchone(
+                    conn,
                     "SELECT close FROM kline_daily_index WHERE symbol=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1",
-                    (symbol, trade_date)).fetchone()
+                    (symbol, trade_date)
+                )
                 if prev:
                     prev_close = prev[0]
 
                 pct_change = ((close - prev_close) / prev_close * 100) if prev_close else 0
 
-                conn.execute('''INSERT OR REPLACE INTO kline_daily_index
-                    (symbol, trade_date, open, high, low, close, volume, amount, pct_change)
-                    VALUES (?,?,?,?,?,?,?,?,?)''',
+                db_execute(conn, sql_insert(
+                    'kline_daily_index',
+                    ['symbol', 'trade_date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_change'],
+                    conflict_cols=['symbol', 'trade_date'],
+                    update_cols=['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_change']
+                ),
                     (symbol, trade_date,
                      float(row.get('open', 0) or 0),
                      float(row.get('high', 0) or 0),
@@ -1283,9 +1452,11 @@ def sync_index_kline():
 def _calc_index_indicators(conn):
     """计算大盘指数的MA5/MA10/MA20和RSI14"""
     for symbol in INDEX_SYMBOLS:
-        rows = conn.execute(
+        rows = db_fetchall(
+            conn,
             "SELECT trade_date, close FROM kline_daily_index WHERE symbol=? ORDER BY trade_date",
-            (symbol,)).fetchall()
+            (symbol,)
+        )
         if len(rows) < 20:
             continue
         closes = [r[1] for r in rows]
@@ -1314,7 +1485,7 @@ def _calc_index_indicators(conn):
             if updates:
                 set_clause = ', '.join(f'{k}=?' for k in updates)
                 vals = list(updates.values()) + [symbol, dates[i]]
-                conn.execute(f"UPDATE kline_daily_index SET {set_clause} WHERE symbol=? AND trade_date=?", vals)
+                db_execute(conn, f"UPDATE kline_daily_index SET {set_clause} WHERE symbol=? AND trade_date=?", tuple(vals))
     conn.commit()
     log("  指数技术指标已更新")
 
@@ -1331,7 +1502,7 @@ def sync_lhb():
         return
 
     conn = connect_db()
-    latest = conn.execute("SELECT MAX(trade_date) FROM lhb_detail").fetchone()[0]
+    latest = db_fetchone(conn, "SELECT MAX(trade_date) FROM lhb_detail")[0]
     conn.close()
 
     dates_to_fetch = []
@@ -1364,11 +1535,14 @@ def sync_lhb():
             if latest and trade_date <= latest:
                 continue
             try:
-                conn.execute('''INSERT OR IGNORE INTO lhb_detail
-                    (trade_date, code, name, reason, buy_amount, sell_amount,
-                     net_amount, turnover, mkt_cap, chg_after_1d, chg_after_5d,
-                     buy_seats, sell_seats, data_source)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                db_execute(conn, sql_insert(
+                    'lhb_detail',
+                    ['trade_date', 'code', 'name', 'reason', 'buy_amount', 'sell_amount',
+                     'net_amount', 'turnover', 'mkt_cap', 'chg_after_1d', 'chg_after_5d',
+                     'buy_seats', 'sell_seats', 'data_source'],
+                    conflict_cols=['trade_date', 'code', 'reason'],
+                    ignore=True
+                ),
                     (trade_date,
                      str(row.get('代码', '')),
                      str(row.get('名称', '')),
@@ -1407,7 +1581,7 @@ def sync_block_trades():
         return
 
     conn = connect_db()
-    latest = conn.execute("SELECT MAX(trade_date) FROM block_trades").fetchone()[0]
+    latest = db_fetchone(conn, "SELECT MAX(trade_date) FROM block_trades")[0]
     conn.close()
 
     if not latest:
@@ -1431,9 +1605,12 @@ def sync_block_trades():
         for _, row in df.iterrows():
             trade_date = str(row.get('交易日期', ''))[:10]
             try:
-                conn.execute('''INSERT OR IGNORE INTO block_trades
-                    (trade_date, code, name, price, volume, amount, buyer, seller)
-                    VALUES (?,?,?,?,?,?,?,?)''',
+                db_execute(conn, sql_insert(
+                    'block_trades',
+                    ['trade_date', 'code', 'name', 'price', 'volume', 'amount', 'buyer', 'seller'],
+                    conflict_cols=['trade_date', 'code', 'price'],
+                    ignore=True
+                ),
                     (trade_date,
                      str(row.get('证券代码', '')),
                      str(row.get('证券简称', '')),
@@ -1451,6 +1628,289 @@ def sync_block_trades():
         return
 
     log(f"  大宗交易完成: +{count}条")
+
+# ============================================================
+# 18. 北向持股增量更新
+# ============================================================
+def sync_northbound_holdings():
+    """获取北向持股数据（按个股）"""
+    log("=== 同步北向持股 ===")
+    try:
+        import akshare as ak
+    except ImportError:
+        log("  akshare 未安装，跳过")
+        return
+    _clear_proxy()
+
+    conn = connect_db()
+    latest = db_fetchone(conn, "SELECT MAX(trade_date) FROM northbound_holdings")[0]
+    if latest and not isinstance(latest, str):
+        latest = str(latest)
+    # 获取有K线数据的股票列表
+    symbols = [r[0] for r in db_fetchall(conn, "SELECT DISTINCT symbol FROM kline_daily ORDER BY symbol")]
+    conn.close()
+
+    count = 0
+    failed = 0
+    for i, sym in enumerate(symbols):
+        code = sym[2:] if sym.startswith(('sz', 'sh')) else sym
+        try:
+            df = ak.stock_hsgt_individual_em(symbol=code)
+            if df is None or df.empty:
+                failed += 1
+                continue
+            conn2 = connect_db()
+            for _, row in df.iterrows():
+                d = str(row.get('持股日期', ''))
+                if latest and d <= latest:
+                    continue
+                shares = float(row.get('持股数量', 0) or 0)
+                pct = float(row.get('持股数量占A股百分比', 0) or 0)
+                if shares <= 0:
+                    continue
+                db_execute(conn2, sql_insert(
+                    'northbound_holdings',
+                    ['symbol', 'trade_date', 'hold_shares', 'hold_pct'],
+                    conflict_cols=['symbol', 'trade_date'],
+                    update_cols=['hold_shares', 'hold_pct']
+                ), (sym, d, shares, pct))
+                count += 1
+            conn2.commit()
+            conn2.close()
+        except Exception as e:
+            failed += 1
+
+        if (i + 1) % 100 == 0:
+            log(f"  北向持股进度: {i+1}/{len(symbols)} 新增{count} 失败{failed}")
+
+    log(f"  北向持股完成: 新增{count}条, 失败{failed}只")
+
+# ============================================================
+# 19. 融资融券明细增量更新
+# ============================================================
+def sync_stock_margin_detail():
+    """获取融资融券明细数据（上交所+深交所）"""
+    log("=== 同步融资融券明细 ===")
+    try:
+        import akshare as ak
+    except ImportError:
+        log("  akshare 未安装，跳过")
+        return
+    _clear_proxy()
+
+    conn = connect_db()
+    latest = db_fetchone(conn, "SELECT MAX(trade_date) FROM stock_margin_detail")[0]
+    if latest and not isinstance(latest, str):
+        latest = str(latest)
+    conn.close()
+
+    count = 0
+    # 从最近的日期开始往回找，最多尝试10天
+    from datetime import datetime, timedelta
+    today = datetime.now()
+    for delta in range(0, 10):
+        d = (today - timedelta(days=delta)).strftime('%Y%m%d')
+        if latest and d <= latest:
+            break
+
+        # 上交所
+        try:
+            df_sse = ak.stock_margin_detail_sse(date=d)
+            if df_sse is not None and not df_sse.empty:
+                conn2 = connect_db()
+                for _, row in df_sse.iterrows():
+                    code = str(row.get('标的证券代码', ''))
+                    if not code:
+                        continue
+                    symbol = f"sh{code}"
+                    db_execute(conn2, sql_insert(
+                        'stock_margin_detail',
+                        ['trade_date', 'symbol', 'name', 'margin_balance', 'margin_buy', 'margin_repay',
+                         'short_volume', 'short_sell', 'short_repay'],
+                        conflict_cols=['trade_date', 'symbol'],
+                        update_cols=['margin_balance', 'margin_buy', 'margin_repay',
+                                     'short_volume', 'short_sell', 'short_repay']
+                    ), (
+                        d, symbol, str(row.get('标的证券简称', '')),
+                        float(row.get('融资余额', 0) or 0),
+                        float(row.get('融资买入额', 0) or 0),
+                        float(row.get('融资偿还额', 0) or 0),
+                        float(row.get('融券余量', 0) or 0),
+                        float(row.get('融券卖出量', 0) or 0),
+                        float(row.get('融券偿还量', 0) or 0)
+                    ))
+                    count += 1
+                conn2.commit()
+                conn2.close()
+        except Exception as e:
+            log(f"  上交所融资融券 {d} 失败: {e}")
+
+        # 深交所
+        try:
+            df_szse = ak.stock_margin_detail_szse(date=d)
+            if df_szse is not None and not df_szse.empty:
+                conn2 = connect_db()
+                for _, row in df_szse.iterrows():
+                    code = str(row.get('证券代码', ''))
+                    if not code:
+                        continue
+                    symbol = f"sz{code}"
+                    db_execute(conn2, sql_insert(
+                        'stock_margin_detail',
+                        ['trade_date', 'symbol', 'name', 'margin_balance', 'margin_buy', 'margin_repay',
+                         'short_volume', 'short_sell', 'short_repay'],
+                        conflict_cols=['trade_date', 'symbol'],
+                        update_cols=['margin_balance', 'margin_buy', 'margin_repay',
+                                     'short_volume', 'short_sell', 'short_repay']
+                    ), (
+                        d, symbol, str(row.get('证券简称', '')),
+                        float(row.get('融资余额', 0) or 0),
+                        float(row.get('融资买入额', 0) or 0),
+                        0,  # 深交所无融资偿还额
+                        float(row.get('融券余量', 0) or 0),
+                        float(row.get('融券卖出量', 0) or 0),
+                        0   # 深交所无融券偿还量
+                    ))
+                    count += 1
+                conn2.commit()
+                conn2.close()
+        except Exception as e:
+            log(f"  深交所融资融券 {d} 失败: {e}")
+
+    log(f"  融资融券明细完成: 新增{count}条")
+
+# ============================================================
+# 20. 业绩预告增量更新
+# ============================================================
+def sync_earnings_forecast():
+    """获取业绩预告数据"""
+    log("=== 同步业绩预告 ===")
+    try:
+        import akshare as ak
+    except ImportError:
+        log("  akshare 未安装，跳过")
+        return
+    _clear_proxy()
+
+    conn = connect_db()
+    latest = db_fetchone(conn, "SELECT MAX(report_date) FROM earnings_forecast")[0]
+    conn.close()
+
+    count = 0
+    # 获取最近几个季度的报告期
+    now = datetime.now()
+    quarters = []
+    for year in range(now.year - 1, now.year + 1):
+        for q_end in ['0331', '0630', '0930', '1231']:
+            q = f"{year}{q_end}"
+            if latest and q <= str(latest):
+                continue
+            quarters.append(q)
+
+    for q in quarters:
+        try:
+            df = ak.stock_yjyg_em(date=q)
+            if df is None or df.empty:
+                continue
+            conn2 = connect_db()
+            for _, row in df.iterrows():
+                code = str(row.get('股票代码', ''))
+                if not code:
+                    continue
+                db_execute(conn2, sql_insert(
+                    'earnings_forecast',
+                    ['code', 'name', 'report_date', 'forecast_type', 'forecast_content',
+                     'profit_min', 'profit_max', 'forecast_change_min', 'forecast_change_max',
+                     'reason', 'prev_year_value', 'announce_date'],
+                    conflict_cols=['code', 'report_date', 'forecast_type'],
+                    update_cols=['name', 'forecast_content', 'profit_min', 'profit_max',
+                                 'forecast_change_min', 'forecast_change_max', 'reason', 'prev_year_value', 'announce_date']
+                ), (
+                    code, str(row.get('股票简称', '')), q,
+                    str(row.get('预告类型', '')),
+                    str(row.get('业绩变动', '')),
+                    float(row.get('预测数值', 0) or 0),
+                    float(row.get('预测数值', 0) or 0),
+                    float(row.get('业绩变动幅度', 0) or 0),
+                    float(row.get('业绩变动幅度', 0) or 0),
+                    str(row.get('业绩变动原因', '')),
+                    float(row.get('上年同期值', 0) or 0),
+                    str(row.get('公告日期', ''))
+                ))
+                count += 1
+            conn2.commit()
+            conn2.close()
+            log(f"  业绩预告 {q}: +{len(df)}条")
+        except Exception as e:
+            log(f"  业绩预告 {q} 失败: {e}")
+
+    log(f"  业绩预告完成: 新增{count}条")
+
+# ============================================================
+# 21. 分红送转增量更新
+# ============================================================
+def sync_dividends():
+    """获取分红送转数据"""
+    log("=== 同步分红送转 ===")
+    try:
+        import akshare as ak
+    except ImportError:
+        log("  akshare 未安装，跳过")
+        return
+    _clear_proxy()
+
+    conn = connect_db()
+    latest = db_fetchone(conn, "SELECT MAX(pay_date) FROM dividends WHERE pay_date IS NOT NULL AND pay_date != ''")[0]
+    conn.close()
+
+    count = 0
+    now = datetime.now()
+    for year in range(now.year - 2, now.year + 1):
+        for q_end in ['0630', '1231']:
+            q = f"{year}{q_end}"
+            if latest and q <= str(latest):
+                continue
+            try:
+                df = ak.stock_fhps_em(date=q)
+                if df is None or df.empty:
+                    continue
+                conn2 = connect_db()
+                for _, row in df.iterrows():
+                    code = str(row.get('代码', ''))
+                    if not code:
+                        continue
+                    db_execute(conn2, sql_insert(
+                        'dividends',
+                        ['stock_code', 'stock_name', 'announce_date', 'div_type',
+                         'bonus_ratio', 'transfer_ratio', 'cash_div',
+                         'record_date', 'ex_div_date', 'pay_date',
+                         'shares_arrive_date', 'div_desc', 'report_period'],
+                        conflict_cols=['stock_code', 'report_period'],
+                        update_cols=['announce_date', 'div_type', 'bonus_ratio', 'transfer_ratio',
+                                     'cash_div', 'record_date', 'ex_div_date', 'pay_date',
+                                     'shares_arrive_date', 'div_desc']
+                    ), (
+                        code, str(row.get('名称', '')),
+                        str(row.get('最新公告日期', '')),
+                        '分红送转',
+                        float(row.get('送转股份-送转总比例', 0) or 0),
+                        float(row.get('送股比例', 0) or 0),
+                        float(row.get('现金分红-现金分红比例', 0) or 0),
+                        str(row.get('股权登记日', '')),
+                        str(row.get('除权除息日', '')),
+                        str(row.get('最新公告日期', '')),
+                        str(row.get('红股上市日', '')),
+                        str(row.get('方案进度', '')),
+                        q
+                    ))
+                    count += 1
+                conn2.commit()
+                conn2.close()
+                log(f"  分红送转 {q}: +{len(df)}条")
+            except Exception as e:
+                log(f"  分红送转 {q} 失败: {e}")
+
+    log(f"  分红送转完成: 新增{count}条")
 
 # ============================================================
 # 主函数
@@ -1476,6 +1936,10 @@ def main():
     parser.add_argument('--index', action='store_true', help='只同步大盘指数K线')
     parser.add_argument('--lhb', action='store_true', help='只同步龙虎榜')
     parser.add_argument('--block', action='store_true', help='只同步大宗交易')
+    parser.add_argument('--northbound-holdings', action='store_true', help='只同步北向持股')
+    parser.add_argument('--margin-detail', action='store_true', help='只同步融资融券明细')
+    parser.add_argument('--earnings', action='store_true', help='只同步业绩预告')
+    parser.add_argument('--dividends', action='store_true', help='只同步分红送转')
     parser.add_argument('--full', action='store_true', help='全量同步（包含周/月K线）')
     args = parser.parse_args()
 
@@ -1485,7 +1949,8 @@ def main():
                     args.valuation, args.flow, args.industry, args.northbound,
                     args.margin, args.shareholder, args.limit,
                     args.news, args.review, args.chip,
-                    args.index, args.lhb, args.block]
+                    args.index, args.lhb, args.block,
+                    args.northbound_holdings, args.margin_detail, args.earnings, args.dividends]
     run_daily = not any(single_flags) and not args.full
 
     log(f"{'='*50}")
@@ -1493,6 +1958,7 @@ def main():
     log(f"{'='*50}")
 
     start_time = time.time()
+    capital_flow_status = None
 
     # 每日必跑（日K线 + 技术指标 + 估值 + 资金流向）
     if run_all or run_daily or args.kline:
@@ -1509,7 +1975,7 @@ def main():
 
     # 资金流向 & 行业板块（每日更新）
     if run_all or run_daily or args.flow:
-        sync_capital_flow()
+        capital_flow_status = sync_capital_flow()
     if run_all or run_daily or args.industry:
         sync_industry()
 
@@ -1539,6 +2005,16 @@ def main():
     if run_all or run_daily or args.block:
         sync_block_trades()
 
+    # 新增数据源 v3
+    if run_all or run_daily or args.northbound_holdings:
+        sync_northbound_holdings()
+    if run_all or run_daily or args.margin_detail:
+        sync_stock_margin_detail()
+    if run_all or run_daily or args.earnings:
+        sync_earnings_forecast()
+    if run_all or run_daily or args.dividends:
+        sync_dividends()
+
     # 周/月K线（仅周末或 --full 时跑，数据量大）
     if run_all or args.weekly:
         sync_weekly_kline()
@@ -1555,13 +2031,14 @@ def main():
                 args.valuation, args.flow, args.industry, args.northbound,
                 args.margin, args.shareholder, args.limit,
                 args.news, args.review, args.chip,
-                args.index, args.lhb, args.block]):
-        validate_and_report(elapsed)
+                args.index, args.lhb, args.block,
+                args.northbound_holdings, args.margin_detail, args.earnings, args.dividends]):
+        validate_and_report(elapsed, capital_flow_status)
 
 # ============================================================
 # 校验 & 飞书告警
 # ============================================================
-def validate_and_report(elapsed):
+def validate_and_report(elapsed, capital_flow_status=None):
     """同步后校验数据完整性，异常发飞书告警"""
     log("=== 数据完整性校验 ===")
     conn = connect_db()
@@ -1571,9 +2048,9 @@ def validate_and_report(elapsed):
     stats = {}
 
     # 1. 日K线 — 最新日期
-    latest_kline = conn.execute("SELECT MAX(trade_date) FROM kline_daily").fetchone()[0]
-    kline_today = conn.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{latest_kline}'").fetchone()[0]
-    total_stocks = conn.execute("SELECT COUNT(DISTINCT symbol) FROM kline_daily").fetchone()[0]
+    latest_kline = db_fetchone(conn, "SELECT MAX(trade_date) FROM kline_daily")[0]
+    kline_today = db_fetchone(conn, "SELECT COUNT(*) FROM kline_daily WHERE trade_date=?", (latest_kline,))[0]
+    total_stocks = db_fetchone(conn, "SELECT COUNT(DISTINCT symbol) FROM kline_daily")[0]
     stats['kline'] = f"{latest_kline} {kline_today}/{total_stocks}只"
 
     if not latest_kline or latest_kline < (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d'):
@@ -1582,39 +2059,58 @@ def validate_and_report(elapsed):
         warnings.append(f"日K线偏少: {latest_kline}只有{kline_today}只（期望≥4000）")
 
     # 2. 技术指标 — RSI/MA
-    has_rsi = conn.execute(f"SELECT COUNT(*) FROM kline_daily WHERE trade_date='{latest_kline}' AND rsi14 IS NOT NULL").fetchone()[0]
+    has_rsi = db_fetchone(conn, "SELECT COUNT(*) FROM kline_daily WHERE trade_date=? AND rsi14 IS NOT NULL", (latest_kline,))[0]
     if has_rsi < kline_today * 0.7:
         warnings.append(f"RSI计算不全: {has_rsi}/{kline_today}只")
 
     # 3. 资金流向
-    flow_latest = conn.execute("SELECT MAX(trade_date) FROM capital_flow").fetchone()[0]
-    flow_count = conn.execute(f"SELECT COUNT(*) FROM capital_flow WHERE trade_date='{flow_latest}'").fetchone()[0] if flow_latest else 0
+    flow_latest = db_fetchone(conn, "SELECT MAX(trade_date) FROM capital_flow")[0]
+    flow_count = db_fetchone(conn, "SELECT COUNT(*) FROM capital_flow WHERE trade_date=?", (flow_latest,))[0] if flow_latest else 0
     stats['capital_flow'] = f"{flow_latest} {flow_count}只"
+    if capital_flow_status and capital_flow_status.get('status') == 'degraded':
+        warnings.append(
+            f"资金流已降级: 最新{capital_flow_status.get('latest_available_date')} {capital_flow_status.get('latest_count', 0)}只, 原因={capital_flow_status.get('reason')}"
+        )
 
     # 4. 估值
-    val_latest = conn.execute("SELECT MAX(trade_date) FROM daily_valuation").fetchone()[0]
-    val_count = conn.execute(f"SELECT COUNT(*) FROM daily_valuation WHERE trade_date='{val_latest}'").fetchone()[0] if val_latest else 0
+    val_latest = db_fetchone(conn, "SELECT MAX(trade_date) FROM daily_valuation")[0]
+    val_count = db_fetchone(conn, "SELECT COUNT(*) FROM daily_valuation WHERE trade_date=?", (val_latest,))[0] if val_latest else 0
     stats['valuation'] = f"{val_latest} {val_count}只"
 
     # 5. 北向资金
-    nb_latest = conn.execute("SELECT MAX(date) FROM northbound_flow").fetchone()[0]
+    nb_latest = db_fetchone(conn, "SELECT MAX(date) FROM northbound_flow")[0]
     stats['northbound'] = nb_latest or "无数据"
 
     # 6. 融资融券
-    margin_latest = conn.execute("SELECT MAX(date) FROM margin_data").fetchone()[0]
+    margin_latest = db_fetchone(conn, "SELECT MAX(date) FROM margin_data")[0]
     stats['margin'] = margin_latest or "无数据"
 
     # 7. 涨跌停
-    limit_latest = conn.execute("SELECT MAX(date) FROM limit_up_down").fetchone()[0]
+    limit_latest = db_fetchone(conn, "SELECT MAX(date) FROM limit_up_down")[0]
     stats['limit_up_down'] = limit_latest or "无数据"
 
     # 8. 财务指标
-    fund_count = conn.execute("SELECT COUNT(DISTINCT symbol) FROM financial_indicators WHERE roe IS NOT NULL").fetchone()[0]
+    fund_count = db_fetchone(conn, "SELECT COUNT(DISTINCT symbol) FROM financial_indicators WHERE roe IS NOT NULL")[0]
     stats['financial'] = f"{fund_count}只"
     if fund_count < 3000:
         warnings.append(f"财务指标偏少: {fund_count}只")
 
     conn.close()
+
+    write_sync_status({
+        'pipeline_stage': 'extended',
+        'ready': len(errors) == 0,
+        'today': today,
+        'target_date': latest_kline,
+        'validation_errors': errors,
+        'validation_warnings': warnings,
+        'stats': stats,
+        'capital_flow': capital_flow_status or {
+            'status': 'unknown',
+            'latest_available_date': flow_latest,
+            'latest_count': flow_count,
+        },
+    })
 
     # 判断是否正常
     status = "❌ 异常" if errors else ("⚠️ 警告" if warnings else "✅ 正常")

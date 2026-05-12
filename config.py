@@ -10,6 +10,7 @@ import threading
 import logging
 from queue import Queue
 from typing import List, Optional
+from urllib.parse import urlparse
 
 
 def _load_env_file():
@@ -19,26 +20,69 @@ def _load_env_file():
         env_file = os.path.join(os.path.dirname(__file__), '.env')
         if os.path.exists(env_file):
             load_dotenv(env_file)
+            try:
+                with open(env_file, 'r') as f:
+                    raw = f.read()
+                repaired = raw.replace('POSTGRES_DSN=', '\nPOSTGRES_DSN=').replace('DATABASE_URL=', '\nDATABASE_URL=').replace('PG_DSN=', '\nPG_DSN=').replace('DB_DSN=', '\nDB_DSN=')
+                for line in repaired.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and (key not in os.environ or not os.environ.get(key)):
+                        os.environ[key] = value
+            except Exception:
+                pass
     except ImportError:
         # Fallback: manual .env loading
         env_file = os.path.join(os.path.dirname(__file__), '.env')
         if os.path.exists(env_file):
             try:
                 with open(env_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key, value = line.split('=', 1)
-                            key = key.strip()
-                            value = value.strip().strip('"').strip("'")
-                            if key and key not in os.environ:
-                                os.environ[key] = value
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line or line.startswith('#') or '=' not in line:
+                            continue
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+
+                        # Recover from a common malformed pattern where multiple KEY=VALUE
+                        # pairs were accidentally concatenated onto one line.
+                        value = value.replace(' POSTGRES_DSN=', '\nPOSTGRES_DSN=')
+                        value = value.replace(' DATABASE_URL=', '\nDATABASE_URL=')
+                        value = value.replace(' PG_DSN=', '\nPG_DSN=')
+                        value = value.replace(' DB_DSN=', '\nDB_DSN=')
+
+                        parts = value.splitlines() if '\n' in value else [value]
+                        first_value = parts[0].strip()
+                        if key and key not in os.environ:
+                            os.environ[key] = first_value
+
+                        for extra in parts[1:]:
+                            if '=' not in extra:
+                                continue
+                            extra_key, extra_value = extra.split('=', 1)
+                            extra_key = extra_key.strip()
+                            extra_value = extra_value.strip().strip('"').strip("'")
+                            if extra_key and extra_key not in os.environ:
+                                os.environ[extra_key] = extra_value
             except Exception as e:
                 print(f"Warning: Failed to load .env file: {e}")
 
 
 # Load .env on module import
 _load_env_file()
+
+
+def is_postgres_url(value: Optional[str]) -> bool:
+    """Return True if the configured DB target is a PostgreSQL DSN/URL."""
+    if not value:
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in ('postgres', 'postgresql')
 
 
 class ConnectionPool:
@@ -96,7 +140,10 @@ class BaseConfig:
     TESTING = False
     
     # Database
+    POSTGRES_DSN = os.getenv('POSTGRES_DSN', os.getenv('PG_DSN', os.getenv('DATABASE_URL', os.getenv('DB_DSN', ''))))
     DB_PATH = os.getenv('DB_PATH', os.path.join(os.path.dirname(__file__), 'data', 'stock_data.db'))
+    DB_URL = POSTGRES_DSN or DB_PATH
+    DB_IS_POSTGRES = is_postgres_url(DB_URL)
     
     # Stock
     STOCK_SYMBOL = os.getenv('STOCK_SYMBOL', 'sz002149')
@@ -150,8 +197,8 @@ class BaseConfig:
         """Validate configuration. Returns list of warnings/errors."""
         issues = []
         
-        if not cls.DB_PATH:
-            issues.append("CRITICAL: DB_PATH is not set")
+        if not cls.DB_URL:
+            issues.append("CRITICAL: DB_URL/DB_PATH is not set")
         
         if not cls.STOCK_SYMBOL:
             issues.append("WARNING: STOCK_SYMBOL is not set, using default 'sz002149'")

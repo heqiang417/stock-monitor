@@ -129,3 +129,5 @@ data/results/
 !data/results/best_RSI<20_weak80%/
 data/results/agent_candidates.jsonl
 .gstack/
+
+.venv/

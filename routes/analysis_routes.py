@@ -112,7 +112,7 @@ def create_analysis_routes(db_path: str):
                 'kline_monthly': {'date_col': 'trade_month', 'symbol_col': 'symbol'},
                 'daily_valuation': {'date_col': 'trade_date', 'symbol_col': 'symbol'},
                 'capital_flow': {'date_col': 'trade_date', 'symbol_col': 'symbol'},
-                'margin_data': {'date_col': 'trade_date', 'symbol_col': 'symbol'},
+                'margin_data': {'date_col': 'trade_date', 'symbol_col': None},
                 'shareholder_data': {'date_col': 'report_date', 'symbol_col': 'symbol'},
                 'northbound_flow': {'date_col': 'trade_date', 'symbol_col': None},
                 'northbound_holdings': {'date_col': 'trade_date', 'symbol_col': 'symbol'},

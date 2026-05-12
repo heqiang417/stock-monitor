@@ -7,6 +7,8 @@ from backtest.engine import (
     BacktestEngine, ClassicStrategies, RiskMetrics, 
     generate_report, BacktestResult
 )
+from db import DatabaseManager
+from config import Config
 import os
 import json
 import copy
@@ -17,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint('backtest', __name__)
 
-# Use the project root data directory for the database
+# Use the configured database target (PostgreSQL first, SQLite fallback)
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(_project_root, 'data', 'stock_data.db')
+DB_PATH = Config.DB_URL
 STRATEGIES_FILE = os.path.join(_project_root, 'strategies.json')
 engine = BacktestEngine(DB_PATH)
 
@@ -455,21 +457,13 @@ def scan_all_strategies():
         watchlist_only = data.get('watchlist_only', False)
         
         # 获取股票列表
-        import sqlite3
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA busy_timeout=5000')
-        conn.execute('PRAGMA synchronous=NORMAL')
-        cursor = conn.cursor()
+        db = DatabaseManager(DB_PATH)
         
         if watchlist_only:
-            cursor.execute("SELECT symbol, name FROM watchlist")
+            stocks = [(row['symbol'], row.get('name', '')) for row in db.fetch_all("SELECT symbol, name FROM watchlist")]
         else:
             # 获取有K线数据的股票
-            cursor.execute("SELECT DISTINCT symbol FROM kline_daily")
-        
-        stocks = cursor.fetchall()
-        conn.close()
+            stocks = [(row['symbol'],) for row in db.fetch_all("SELECT DISTINCT symbol FROM kline_daily")]
         
         if strategy_id not in STRATEGY_MAP:
             return jsonify({"error": f"未知策略: {strategy_id}"}), 400

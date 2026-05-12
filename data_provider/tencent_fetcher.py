@@ -96,6 +96,11 @@ class TencentFetcher(BaseFetcher):
                 if len(row) >= 6:
                     close = float(row[2])
                     chg_pct = round((close - prev_close) / prev_close * 100, 2) if prev_close else 0
+                    # row[6] may be a dict (dividend info) instead of amount
+                    raw_amount = row[6] if len(row) > 6 else 0
+                    amount = float(raw_amount) if isinstance(raw_amount, (int, float, str)) and not isinstance(raw_amount, dict) else 0
+                    raw_chg = row[8] if len(row) > 8 else None
+                    chg_pct_val = float(raw_chg) if isinstance(raw_chg, (int, float, str)) and not isinstance(raw_chg, dict) else chg_pct
                     records.append({
                         'date': str(row[0]),
                         'open': float(row[1]),
@@ -103,8 +108,8 @@ class TencentFetcher(BaseFetcher):
                         'high': float(row[3]),
                         'low': float(row[4]),
                         'volume': float(row[5]),
-                        'amount': float(row[6]) if len(row) > 6 else 0,
-                        'chg_pct': float(row[8]) if len(row) > 8 else chg_pct,
+                        'amount': amount,
+                        'chg_pct': chg_pct_val,
                     })
                     prev_close = close
 

@@ -11,7 +11,7 @@ from collections import deque
 from typing import Set, Dict, Any, Optional, List
 from concurrent.futures import ThreadPoolExecutor
 
-from db import DatabaseManager
+from db import DatabaseManager, _is_postgres_target
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ class BackgroundService:
         self.feishu_service = feishu_service
         self.config = config
         
-        self._db = DatabaseManager(config.DB_PATH)
+        self._db = DatabaseManager(config.DB_URL)
         self._stop_event = threading.Event()
         self._threads: List[threading.Thread] = []
         
@@ -82,37 +82,70 @@ class BackgroundService:
         try:
             with self._db.get_connection() as conn:
                 c = conn.cursor()
-                c.execute('''CREATE TABLE IF NOT EXISTS alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER NOT NULL,
-                    strategy_id TEXT,
-                    message TEXT,
-                    level TEXT DEFAULT 'info',
-                    stock TEXT,
-                    trigger_condition TEXT,
-                    price REAL,
-                    is_read INTEGER DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )''')
-                c.execute('CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp)')
-                c.execute('CREATE INDEX IF NOT EXISTS idx_alerts_level_read ON alerts(level, is_read)')
-                c.execute('''CREATE TABLE IF NOT EXISTS alert_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER NOT NULL,
-                    stock TEXT,
-                    price REAL,
-                    chg_pct REAL,
-                    strategy_id TEXT,
-                    strategy_name TEXT,
-                    trigger_condition TEXT,
-                    message TEXT,
-                    level TEXT DEFAULT 'info',
-                    feishu_sent INTEGER DEFAULT 0,
-                    is_read INTEGER DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )''')
-                c.execute('CREATE INDEX IF NOT EXISTS idx_alert_history_stock_ts ON alert_history(stock, timestamp)')
-                c.execute('CREATE INDEX IF NOT EXISTS idx_alert_history_level_read ON alert_history(level, is_read)')
+                if _is_postgres_target(self.config.DB_URL):
+                    c.execute('''CREATE TABLE IF NOT EXISTS alerts (
+                        id BIGSERIAL PRIMARY KEY,
+                        timestamp BIGINT NOT NULL,
+                        strategy_id TEXT,
+                        message TEXT,
+                        level TEXT DEFAULT 'info',
+                        stock TEXT,
+                        trigger_condition TEXT,
+                        price DOUBLE PRECISION,
+                        is_read INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp)')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alerts_level_read ON alerts(level, is_read)')
+                    c.execute('''CREATE TABLE IF NOT EXISTS alert_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        timestamp BIGINT NOT NULL,
+                        stock TEXT,
+                        price DOUBLE PRECISION,
+                        chg_pct DOUBLE PRECISION,
+                        strategy_id TEXT,
+                        strategy_name TEXT,
+                        trigger_condition TEXT,
+                        message TEXT,
+                        level TEXT DEFAULT 'info',
+                        feishu_sent INTEGER DEFAULT 0,
+                        is_read INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alert_history_stock_ts ON alert_history(stock, timestamp)')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alert_history_level_read ON alert_history(level, is_read)')
+                else:
+                    c.execute('''CREATE TABLE IF NOT EXISTS alerts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp INTEGER NOT NULL,
+                        strategy_id TEXT,
+                        message TEXT,
+                        level TEXT DEFAULT 'info',
+                        stock TEXT,
+                        trigger_condition TEXT,
+                        price REAL,
+                        is_read INTEGER DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp)')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alerts_level_read ON alerts(level, is_read)')
+                    c.execute('''CREATE TABLE IF NOT EXISTS alert_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp INTEGER NOT NULL,
+                        stock TEXT,
+                        price REAL,
+                        chg_pct REAL,
+                        strategy_id TEXT,
+                        strategy_name TEXT,
+                        trigger_condition TEXT,
+                        message TEXT,
+                        level TEXT DEFAULT 'info',
+                        feishu_sent INTEGER DEFAULT 0,
+                        is_read INTEGER DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alert_history_stock_ts ON alert_history(stock, timestamp)')
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_alert_history_level_read ON alert_history(level, is_read)')
             logger.info("Alert tables initialized")
         except Exception as e:
             logger.error(f"Failed to init alert tables: {e}", exc_info=True)
@@ -224,17 +257,23 @@ class BackgroundService:
         try:
             with self._db.get_connection() as conn:
                 c = conn.cursor()
-                # Lazy init: create table if it doesn't exist
-                c.execute('''CREATE TABLE IF NOT EXISTS alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER NOT NULL, strategy_id TEXT, message TEXT,
-                    level TEXT DEFAULT 'info', stock TEXT, trigger_condition TEXT,
-                    price REAL, is_read INTEGER DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                c.execute('''INSERT INTO alerts (timestamp, strategy_id, message, level, stock, trigger_condition, price)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    (int(time.time() * 1000), strategy_id, message, level,
-                      self.config.STOCK_SYMBOL, message, 0))
+                if _is_postgres_target(self.config.DB_URL):
+                    c.execute('''INSERT INTO alerts (timestamp, strategy_id, message, level, stock, trigger_condition, price)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+                        (int(time.time() * 1000), strategy_id, message, level,
+                          self.config.STOCK_SYMBOL, message, 0))
+                else:
+                    # Lazy init: create table if it doesn't exist
+                    c.execute('''CREATE TABLE IF NOT EXISTS alerts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp INTEGER NOT NULL, strategy_id TEXT, message TEXT,
+                        level TEXT DEFAULT 'info', stock TEXT, trigger_condition TEXT,
+                        price REAL, is_read INTEGER DEFAULT 0,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                    c.execute('''INSERT INTO alerts (timestamp, strategy_id, message, level, stock, trigger_condition, price)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+                        (int(time.time() * 1000), strategy_id, message, level,
+                          self.config.STOCK_SYMBOL, message, 0))
         except Exception as e:
             logger.error(f"Failed to insert alert: {e}", exc_info=True)
     
@@ -259,7 +298,7 @@ class BackgroundService:
                     c.execute('''INSERT INTO alert_history 
                         (timestamp, stock, price, chg_pct, strategy_id, strategy_name, 
                          trigger_condition, message, level, feishu_sent)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                         (int(time.time() * 1000),
                          stock or self.config.STOCK_SYMBOL,
                          price, chg_pct, '',
