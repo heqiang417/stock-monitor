@@ -1,180 +1,329 @@
-# 股票盯盘系统（重建版结构入口）
+# 股票盯盘系统
 
-> 这是一个**研究驱动的实盘辅助系统**：白天同步数据，盘后筛选策略，输出每日选股与研究结论。
-> 当前仓库已经完成第一轮结构重建：先明确主线、分层和归档边界，再逐步继续代码层重构。
-
----
-
-## 1. 这个项目现在到底干什么
-
-核心主线现在是五步：
-
-1. **17:00 基础同步（K线 / 指数K线 / MA / RSI / BB / PEPB）**
-2. **17:30 扩展同步（北向 / 两融 / 股东 / 新闻 / 复盘 / 筹码 / 涨跌停 / 龙虎榜 / 大宗 / 资金流 / 行业）**
-3. **选股前补齐 / 校验数据可用性**
-4. **运行当前在用策略**
-5. **推送每日选股结果到飞书**
-
-所以它不是一个泛化量化平台，而是一个：
-
-> **面向 A 股日常选股、策略迭代、盘后推送的辅助系统**
+> A 股选股辅助系统：负责基础/扩展行情同步、策略评估、盘后选股与飞书文本推送。
 
 ---
 
-## 2. 当前唯一应该优先理解的入口
+## 1. 当前生产主链路
 
-### 生产运行层（每天真实在跑）
+每天真实运行的主线：
 
-| 入口 | 作用 |
-|------|------|
-| `scripts/daily/update_tencent.py` | 收盘后主数据同步（含指数K线 + 当天增量补算） |
-| `scripts/daily/calc_bollinger.py` | 计算/补齐布林带 |
-| `scripts/daily/daily_sync.py` | 扩展数据同步（北向/两融/股东/新闻/复盘/筹码/涨跌停/龙虎榜/大宗/资金流/行业） |
-| `scripts/daily/daily_pick_combined.py` | **当前唯一在用的每日选股入口**（选股前先校验，必要时自动补齐） |
-| `docs/ops/crontab.md` | 当前定时任务运行说明 |
+1. `17:00` `scripts/daily/update_tencent.py`
+   - 同步日 K、指数 K、MA、RSI、BB、PE/PB 等基础数据
+2. `17:30` `scripts/daily/daily_sync.py`
+   - 同步北向、两融、涨跌停、资金流、行业等扩展数据
+3. `20:30` `scripts/daily/daily_pick_combined.py --push --wait`
+   - 校验数据完整性
+   - 执行正式策略
+   - 发送飞书纯文本推送
 
-### 当前在用策略
-
+当前正式策略：
 - `BB1.00`
 - `BB1.02+KDJ`
+- `TP4.5`
 
-历史/对照策略：
-- `Fstop3_pt5 v10`（已降级，不再属于正式每日策略池）
+策略配置统一放在：
+- `configs/strategy/bb100.yaml`
+- `configs/strategy/bb102_kdj.yaml`
+- `configs/strategy/tp45.yaml`
 
-策略总览：
-- `docs/strategy/STRATEGY_INDEX.md`
-
----
-
-## 3. 项目分层（重建后的官方口径）
-
-### A. Production / 生产运行层
-负责每日真实执行。
-
-目录 / 文件：
-- `scripts/daily/`
-- `docs/ops/`
-- `reports/daily_picks/`（运行结果，本地留痕，不作为核心源码资产）
-
-特点：
-- 只有这一层可以直接影响每日推送
-- 变更要谨慎，优先稳定性
+统一加载入口：`configs/strategy_loader.py`
 
 ---
 
-### B. Evaluation / 标准评估层
-负责统一评估策略，不直接上线。
+## 2. 根目录每个文件 / 文件夹用途
 
-目录：
-- `scripts/evaluation/`
-- `docs/EVAL_FRAMEWORK.md`
-- `docs/backtesting/reports/`（当前主线评估报告）
-
-特点：
-- 这里的目标是统一口径
-- 所有“策略是否合格”的结论，都应尽量从这一层产出
-
----
-
-### C. Exploration / 策略探索层
-负责试新方向、扩样本、调参数。
-
-目录：
-- `scripts/exploration/`
-
-当前重点脚本：
-- `explore_direction_4_expand_test_samples.py`
-- `explore_direction_5_fine_tune_train_winrate.py`
-- `explore_direction_6_sample_first.py`
-
-特点：
-- **探索不等于上线**
-- 任何探索结果都必须经过评估层确认，再进入生产层
-
----
-
-### D. Archive / 历史归档层
-负责存放旧报告、旧方案、旧链条。
-
-目录：
-- `docs/backtesting/archive/`
-- `scripts/backtest_legacy/`
-
-特点：
-- 保留历史价值
-- 但不参与当前主线决策
-
----
-
-## 4. 当前目录结构（按职责理解）
-
-```text
-stock-monitor-app-py/
-├── scripts/
-│   ├── daily/                 # 生产运行入口（cron 真正在调）
-│   ├── evaluation/            # 标准评估入口
-│   ├── exploration/           # 策略探索 / 参数搜索
-│   ├── backtest_legacy/       # 历史脚本归档
-│   └── README.md              # 脚本分层说明
-│
-├── docs/
-│   ├── ops/                   # 运维 / crontab / 部署说明
-│   ├── strategy/              # 当前策略手册与总览
-│   ├── backtesting/
-│   │   ├── reports/           # 当前主线报告
-│   │   └── archive/           # 历史报告归档
-│   └── EVAL_FRAMEWORK.md      # 统一评估框架
-│
-├── reports/daily_picks/       # 每日推送留痕（运行产物）
-├── data/                      # 数据库 / 中间结果
-├── backtest/                  # 回测产出 / trades / 中间资产
-└── README.md                  # 当前文件
-```
+| 路径 | 类型 | 作用 |
+|---|---|---|
+| `app.py` | 文件 | Flask 应用主入口，负责创建 app、初始化服务、注册蓝图和 websocket |
+| `config.py` | 文件 | 全局配置定义，包含数据库、日志、认证、运行参数 |
+| `requirements.txt` | 文件 | Python 依赖列表 |
+| `pyproject.toml` | 文件 | Python 项目元数据与开发工具配置 |
+| `Makefile` | 文件 | 常用命令入口，如 `make pick / sync / eval / test / lint / run` |
+| `Dockerfile` | 文件 | Docker 镜像构建配置 |
+| `docker-compose.yml` | 文件 | 本地/部署环境编排配置 |
+| `package_for_review.sh` | 文件 | 打包项目用于审阅/归档的辅助脚本 |
+| `.env.example` | 文件 | 环境变量模板 |
+| `.env` | 文件 | 本地环境变量文件 |
+| `.gitignore` | 文件 | Git 忽略规则 |
+| `.dockerignore` | 文件 | Docker 构建忽略规则 |
+| `.coveragerc` | 文件 | 测试覆盖率配置 |
+| `.coverage` | 文件 | 本地测试覆盖率产物，不属于业务源码 |
+| `.secret_key` | 文件 | 本地 secret key 文件 |
+| `feishu_config.json` | 文件 | 飞书推送配置 |
+| `stock_data.db` | 文件 | 根目录 SQLite 数据库，当前仍被部分回测/服务旧代码引用 |
+| `stock_data_full.json` | 文件 | 历史全量股票 JSON 数据文件，当前仍被 `services/market_service.py` 默认读取 |
+| `stocks.db` | 文件 | 额外数据库文件，当前未发现明确代码引用，偏历史残留 |
+| `backtest/` | 目录 | 回测引擎、回测 API 与部分历史回测产物 |
+| `configs/` | 目录 | 配置代码与策略 YAML |
+| `data/` | 目录 | 当前主数据目录，包含 `data/stock_data.db` 等真实运行数据资产 |
+| `data_provider/` | 目录 | 数据抓取层，封装 Tencent/Akshare/Baostock/Tushare 等来源 |
+| `db/` | 目录 | 数据库辅助模块与历史数据库文件 |
+| `docs/` | 目录 | 文档中心：策略、评估、运维、结构、迁移审计 |
+| `models/` | 目录 | 数据模型定义 |
+| `reports/` | 目录 | 运行过程中的输出/失败记录目录 |
+| `routes/` | 目录 | Flask API 路由层 |
+| `run_tests.sh` | 文件 | 测试执行辅助脚本 |
+| `scripts/` | 目录 | 生产、评估、迁移、报表相关脚本 |
+| `services/` | 目录 | 业务服务层 |
+| `static/` | 目录 | Web 静态资源 |
+| `templates/` | 目录 | Flask HTML 模板 |
+| `tests/` | 目录 | 自动化测试 |
+| `utils/` | 目录 | 通用工具模块，目前内容较少 |
+| `.venv/` | 目录 | Hermes 当前使用的本地虚拟环境/工具环境，不属于业务代码 |
+| `venv/` | 目录 | 旧本地虚拟环境，已尝试清理，但仍被 FUSE 占用残留阻塞完全删除 |
+| `__pycache__/` | 目录 | Python 字节码缓存，不属于源码 |
 
 ---
 
-## 5. 现在的结构结论
+## 3. 逐目录说明（按阅读优先级）
 
-当前仓库已经从“研究脚本堆积”进入到：
+### 3.1 `scripts/` —— 你最该先看的目录
 
-> **主线明确，但仍在从研究型仓库向稳定产品型仓库过渡。**
+#### `scripts/daily/`
+生产主链路目录。
 
-已经完成的重建：
-- 报告从主目录与历史目录分离
-- 生产 / 评估 / 探索 三层职责更清楚
-- 当前策略状态、crontab 说明、daily_sync 修复已同步到文档与代码
-- Fstop3 已明确降级为历史/对照策略，正式每日策略池收敛为 `BB1.00 + BB1.02+KDJ`
+关键文件：
+- `update_tencent.py`：基础日线/指标同步入口
+- `daily_sync.py`：扩展数据同步入口
+- `daily_pick_combined.py`：正式每日选股入口
+- `sync_health.py`：同步健康检查
+- `check_strategy_consistency.py`：策略口径一致性检查
+- `calc_*.py`：各类指标/特征补算脚本，如 ATR、ADX、OBV、BB 宽度等
 
-仍建议后续继续做的重建：
-1. 把一次性维护脚本继续从主脚本目录中分离
-2. 给环境变量 / 运行依赖补正式 runtime 文档
-3. 逐步收缩历史生产脚本（如 `daily_pick_v10.py` / `daily_pick_bb099.py` / `daily_pick_bb100.py`）
-4. 最终把“当前唯一官方入口”收得更硬
+#### `scripts/evaluation/`
+- `strategy_evaluator.py`：统一策略评估入口
 
----
+#### `scripts/migration/`
+- `sqlite_to_postgres.py`：SQLite → PostgreSQL 迁移脚本
+- `postgres_schema.sql`：PostgreSQL schema
+- `postgres_schema_partitioned.sql`：分区版 schema
+- `README_postgres_migration.md`：迁移说明
 
-## 6. 如果你只看三个文件
+#### `scripts/reports/`
+- `daily_picks/*.json`：历史每日推送结果留痕
 
-请先看：
-
-1. `docs/strategy/STRATEGY_INDEX.md`
-2. `docs/ops/crontab.md`
-3. `scripts/README.md`
-
-如果你只想知道“今天系统到底怎么跑”：
-
-- 看 `scripts/daily/`
-- 看 `docs/ops/crontab.md`
-- 看 `daily_pick_combined.py`
-- 当前真实顺序是：
-  **17:00 基础同步 → 17:30 扩展同步 → 20:30 选股推送 → 异常时双阶段兜底补齐**
+#### `scripts/README.md`
+- 脚本分层说明文档
 
 ---
 
-## 7. 当前原则
+### 3.2 `services/` —— 业务逻辑核心层
 
-- **生产脚本优先稳定，不随探索结果直接改。**
-- **探索脚本先求样本与稳定性，不追漂亮但低样本的指标。**
-- **正式每日策略池当前为 `BB1.00 + BB1.02+KDJ`，Fstop3 仅作历史/对照。**
-- **历史报告保留，但不干扰当前主线。**
-- **文档必须反映真实运行状态。**
+关键文件：
+- `stock_service.py`：股票数据查询与主业务服务
+- `market_service.py`：市场数据装载与行业/市场信息服务
+- `strategy_service.py`：策略管理与执行协调
+- `background_service.py`：后台任务与推送调度
+- `feishu_service.py`：飞书消息发送
+- `backtest_service.py`：回测服务封装
+- `quote_service.py`：行情报价相关服务
+- `market_state.py`：市场状态判断
+- `signal_standardizer.py`：策略信号标准化
+- `dashboard_formatter.py`：面板输出格式化
+- `news_sentiment.py`：新闻情绪相关处理
+
+---
+
+### 3.3 `routes/` —— Flask API 路由层
+
+关键文件：
+- `routes/__init__.py`：蓝图注册入口
+- `stock_routes.py`：股票相关接口
+- `strategy_routes.py`：策略相关接口
+- `analysis_routes.py`：分析类接口
+- `dashboard_routes.py`：仪表盘接口
+- `kline_routes.py`：K 线接口
+- `fundamental_routes.py`：基本面接口
+- `alert_routes.py`：预警接口
+- `db_routes.py`：数据库相关接口
+- `backtest_routes.py`：回测接口
+
+---
+
+### 3.4 `backtest/` —— 回测代码与历史产物
+
+关键文件：
+- `engine.py`：回测引擎核心
+- `api.py`：回测 API/辅助接口
+- `agent_backtest.py`：脚本化回测入口
+- `trades_v10_Fstop3_pt5.json`：历史交易明细产物
+
+说明：
+- 当前这里还存在“代码”和“历史产物”混放的问题
+- 且有旧代码仍默认引用根目录 `stock_data.db`
+
+---
+
+### 3.5 `configs/` —— 统一配置层
+
+关键文件：
+- `strategy_loader.py`：策略 YAML 统一加载器
+- `strategy/bb100.yaml`：BB1.00 配置
+- `strategy/bb102_kdj.yaml`：BB1.02+KDJ 配置
+- `strategy/tp45.yaml`：TP4.5 配置
+
+---
+
+### 3.6 `data/` —— 当前真实数据目录
+
+你现在的运行主链路主要依赖这里，而不是根目录那些历史数据文件。
+
+关键内容：
+- `data/stock_data.db`：当前主 SQLite 数据库
+- `data/stock_data_ro.db`：只读/辅助数据库
+- `data/results/`：部分结果数据
+- `failed_*.txt`：同步失败记录
+- 若干 `*.json`：中间数据与统计结果
+
+---
+
+### 3.7 `docs/` —— 文档中心
+
+建议优先阅读：
+- `docs/strategy/STRATEGY_INDEX.md`：策略总览
+- `docs/EVAL_FRAMEWORK.md`：统一评估框架
+- `docs/ops/crontab.md`：生产 cron 说明
+- `docs/PROJECT_STRUCTURE.md`：结构说明
+- `docs/ops/runtime.md`：运行时说明
+- `docs/pg-migration-audit-2026-04-27.md`：PG 迁移审计记录
+
+---
+
+### 3.8 `data_provider/` —— 数据源封装层
+
+关键文件：
+- `manager.py`：数据源管理
+- `base.py`：抽象基类
+- `tencent_fetcher.py`
+- `akshare_fetcher.py`
+- `baostock_fetcher.py`
+- `efinance_fetcher.py`
+- `tushare_fetcher.py`
+
+---
+
+### 3.9 `models/`
+关键文件：
+- `stock.py`
+- `strategy.py`
+- `alert.py`
+
+---
+
+### 3.10 `tests/`
+关键文件：
+- `test_daily_pick_yaml_integration.py`：策略 YAML 集成测试
+- `test_web_ui.py`：Web UI 测试（Playwright 可选依赖）
+- `test_api.py`：API 测试
+- `test_backtest_engine.py`：回测引擎测试
+- `test_backtest_service.py`：回测服务测试
+- `test_stock_service.py`：股票服务测试
+- `test_market_service.py`：市场服务测试
+- `test_strategy_service.py`：策略服务测试
+- `test_background_service.py`：后台服务测试
+- `test_feishu_service.py`：飞书服务测试
+- `test_strategies.py`：策略逻辑测试
+- `test_utils.py`：工具测试
+- `conftest.py`：pytest 公共 fixture
+
+---
+
+### 3.11 `static/` 和 `templates/`
+- `templates/index.html`：前端页面模板
+- `static/js/`、`static/css/`、`static/icons/`：前端静态资源
+- `static/manifest.json`、`service-worker.js`：PWA 相关资源
+
+说明：
+- 我已经删除了 `static/stock-monitor-app-py.tar.gz`，因为它是打包产物，不应该放在这里
+
+---
+
+## 4. 这次新增清理结果
+
+### 第一轮已删
+- `.pytest_cache/`
+- `logs/`
+- `results/`
+- `app.log`
+- `app.log.1`
+- `backtest/agent_backtest.py.subagent_broken`
+
+### 第二轮已删
+- `.gstack/`
+- `.hermes/`
+- `.fuse_hidden0000033b0000032b`（根目录残留）
+- `static/stock-monitor-app-py.tar.gz`
+
+---
+
+## 5. 目前还没直接删、但已经确认值得继续处理的对象
+
+### `stocks.db`
+- 目前没搜到明确代码引用
+- 很像历史残留
+- **倾向后续删除**
+
+### `venv/`
+- 我已经尝试删除
+- 但内部不断生成 `.fuse_hidden*` 残留，说明仍有进程占用
+- 这属于你这个环境里之前提到过的 FUSE/pycache 类问题
+- **需要等占用进程退出后再删**
+
+### `__pycache__/`
+- 仍是缓存目录
+- 可以清，但最好在确认无进程占用时统一删
+
+### 根目录 `stock_data.db`
+- 暂时不能删
+- 因为 `services/backtest_service.py` 与 `backtest/engine.py` 仍直接默认引用它
+
+### 根目录 `stock_data_full.json`
+- 暂时不能删
+- 因为 `services/market_service.py` 默认仍从这里读取
+
+---
+
+## 6. 目前仓库里最值得继续优化的结构问题
+
+1. **历史路径仍混用**
+   - 生产主链路多数已经走 `data/stock_data.db`
+   - 但回测/市场服务仍有部分旧代码引用根目录 `stock_data.db` 和 `stock_data_full.json`
+
+2. **回测目录混放**
+   - `backtest/` 同时放代码和历史交易 JSON
+
+3. **本地环境残留未完全去除**
+   - `venv/`
+   - `__pycache__/`
+   - 新生成的 `.fuse_hidden*`
+
+---
+
+## 7. 快速阅读顺序
+
+如果你要快速理解这个项目，建议按这个顺序看：
+
+1. `README.md`
+2. `docs/strategy/STRATEGY_INDEX.md`
+3. `docs/EVAL_FRAMEWORK.md`
+4. `docs/ops/crontab.md`
+5. `scripts/daily/daily_pick_combined.py`
+6. `configs/strategy/*.yaml`
+7. `services/stock_service.py`
+
+---
+
+## 8. 当前结论
+
+这次已经把 README 从“抽象结构说明”升级成了：
+- 根目录逐项说明
+- 关键目录逐项说明
+- 关键文件点名说明
+- 已清理内容明确落表
+- 仍有技术债的对象明确标记
+
+如果继续收拾，下一步最值得做的是：
+1. 改代码，把根目录 `stock_data.db` / `stock_data_full.json` 的旧引用迁到 `data/`
+2. 然后删除 `stocks.db`
+3. 等占用进程结束后彻底删除 `venv/` 与缓存残留

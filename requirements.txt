@@ -8,3 +8,4 @@ pytest>=8.0.0
 Pillow>=11.0.0
 numpy>=1.24.0
 psycopg2-binary>=2.9.9
+PyYAML>=6.0

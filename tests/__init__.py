@@ -1,1 +1,0 @@
-# Stock Monitor Test Suite
