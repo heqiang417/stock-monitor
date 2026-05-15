@@ -141,7 +141,10 @@ def _q(sql: str) -> str:
 
 def _exec(conn, sql: str, params=()):
     cur = conn.cursor()
-    cur.execute(_q(sql), params)
+    if params is None:
+        cur.execute(_q(sql))
+    else:
+        cur.execute(_q(sql), params)
     return cur
 
 
@@ -178,6 +181,23 @@ def _upsert_kline_sql(table: str) -> str:
         ON CONFLICT(symbol, trade_date) DO UPDATE SET
         open=excluded.open, close=excluded.close, high=excluded.high, low=excluded.low,
         volume=excluded.volume, amount=excluded.amount, chg=excluded.chg, chg_pct=excluded.chg_pct'''
+
+
+def get_runtime_python() -> str:
+    """Prefer configured runtime python when the path exists; otherwise fall back safely."""
+    candidates = [
+        os.environ.get('RUNTIME_PYTHON'),
+        os.path.join(PROJECT_ROOT, '.venv', 'bin', 'python'),
+        sys.executable,
+        '/usr/bin/python3',
+    ]
+    for candidate in candidates:
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return sys.executable or 'python3'
+
 
 
 # === 日志 ===

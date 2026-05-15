@@ -34,8 +34,9 @@ class BackgroundService:
         self.strategy_service = strategy_service
         self.feishu_service = feishu_service
         self.config = config
-        
-        self._db = DatabaseManager(config.DB_URL)
+
+        db_target = getattr(config, 'DB_URL', None) or getattr(config, 'DB_PATH', None)
+        self._db = DatabaseManager(db_target)
         self._stop_event = threading.Event()
         self._threads: List[threading.Thread] = []
         
@@ -82,7 +83,8 @@ class BackgroundService:
         try:
             with self._db.get_connection() as conn:
                 c = conn.cursor()
-                if _is_postgres_target(self.config.DB_URL):
+                db_url = getattr(self.config, 'DB_URL', None) or getattr(self.config, 'DB_PATH', None)
+                if _is_postgres_target(db_url):
                     c.execute('''CREATE TABLE IF NOT EXISTS alerts (
                         id BIGSERIAL PRIMARY KEY,
                         timestamp BIGINT NOT NULL,
@@ -257,7 +259,8 @@ class BackgroundService:
         try:
             with self._db.get_connection() as conn:
                 c = conn.cursor()
-                if _is_postgres_target(self.config.DB_URL):
+                db_url = getattr(self.config, 'DB_URL', None) or getattr(self.config, 'DB_PATH', None)
+                if _is_postgres_target(db_url):
                     c.execute('''INSERT INTO alerts (timestamp, strategy_id, message, level, stock, trigger_condition, price)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)''',
                         (int(time.time() * 1000), strategy_id, message, level,
@@ -271,7 +274,7 @@ class BackgroundService:
                         price REAL, is_read INTEGER DEFAULT 0,
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
                     c.execute('''INSERT INTO alerts (timestamp, strategy_id, message, level, stock, trigger_condition, price)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
                         (int(time.time() * 1000), strategy_id, message, level,
                           self.config.STOCK_SYMBOL, message, 0))
         except Exception as e:
@@ -295,16 +298,23 @@ class BackgroundService:
             try:
                 with self._db.get_connection() as conn:
                     c = conn.cursor()
-                    c.execute('''INSERT INTO alert_history 
+                    db_url = getattr(self.config, 'DB_URL', None) or getattr(self.config, 'DB_PATH', None)
+                    sql = '''INSERT INTO alert_history 
                         (timestamp, stock, price, chg_pct, strategy_id, strategy_name, 
                          trigger_condition, message, level, feishu_sent)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                        (int(time.time() * 1000),
-                         stock or self.config.STOCK_SYMBOL,
-                         price, chg_pct, '',
-                         strategy_name or '', trigger_condition or '',
-                         message, alert_level,
-                         1 if result.get('success') else 0))
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)'''
+                    params = (
+                        int(time.time() * 1000),
+                        stock or self.config.STOCK_SYMBOL,
+                        price, chg_pct, '',
+                        strategy_name or '', trigger_condition or '',
+                        message, alert_level,
+                        1 if result.get('success') else 0,
+                    )
+                    if _is_postgres_target(db_url):
+                        c.execute(sql, params)
+                    else:
+                        c.execute(sql.replace('%s', '?'), params)
             except Exception as e:
                 logger.error(f"Failed to record alert history: {e}", exc_info=True)
             

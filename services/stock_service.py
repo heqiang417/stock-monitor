@@ -232,22 +232,20 @@ class StockService:
     
     def insert_stock_history(self, data: dict):
         """Insert a stock data record into the database."""
-        with self._db.get_connection() as conn:
-            c = conn.cursor()
-            c.execute('''
-                INSERT INTO stock_history 
-                (timestamp, price, open, high, low, volume, amount, chg, chg_pct, 
-                 bid1_price, bid1_vol, ask1_price, ask1_vol)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ''', (
-                data.get('timestamp', int(time.time() * 1000)),
-                data.get('price', 0), data.get('open', 0),
-                data.get('high', 0), data.get('low', 0),
-                data.get('volume', 0), data.get('amount', 0),
-                data.get('chg', 0), data.get('chg_pct', 0),
-                data.get('bid1_price', 0), data.get('bid1_vol', 0),
-                data.get('ask1_price', 0), data.get('ask1_vol', 0)
-            ))
+        self._db.execute('''
+            INSERT INTO stock_history 
+            (timestamp, price, open, high, low, volume, amount, chg, chg_pct, 
+             bid1_price, bid1_vol, ask1_price, ask1_vol)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data.get('timestamp', int(time.time() * 1000)),
+            data.get('price', 0), data.get('open', 0),
+            data.get('high', 0), data.get('low', 0),
+            data.get('volume', 0), data.get('amount', 0),
+            data.get('chg', 0), data.get('chg_pct', 0),
+            data.get('bid1_price', 0), data.get('bid1_vol', 0),
+            data.get('ask1_price', 0), data.get('ask1_vol', 0)
+        ))
     
     def get_stock_history(self, limit: int = 100) -> List[dict]:
         """Get recent stock history from database."""
@@ -285,48 +283,46 @@ class StockService:
     
     def save_kline_daily(self, symbol: str, kline_data: List[dict]):
         """Save daily K-line data to database."""
-        with self._db.get_connection() as conn:
-            c = conn.cursor()
-            for row in kline_data:
-                try:
-                    if _is_postgres_target(self.db_path):
-                        c.execute('''
-                            INSERT INTO kline_daily 
-                            (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct, ma5, ma10, ma20, ma60, rsi14)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (symbol, trade_date) DO UPDATE SET
-                                open = EXCLUDED.open,
-                                close = EXCLUDED.close,
-                                high = EXCLUDED.high,
-                                low = EXCLUDED.low,
-                                volume = EXCLUDED.volume,
-                                amount = EXCLUDED.amount,
-                                chg = EXCLUDED.chg,
-                                chg_pct = EXCLUDED.chg_pct,
-                                ma5 = EXCLUDED.ma5,
-                                ma10 = EXCLUDED.ma10,
-                                ma20 = EXCLUDED.ma20,
-                                ma60 = EXCLUDED.ma60,
-                                rsi14 = EXCLUDED.rsi14
-                        ''', (
-                            symbol, row.get('date'), row.get('open'), row.get('close'),
-                            row.get('high'), row.get('low'), row.get('volume'), row.get('amount', 0),
-                            row.get('chg', 0), row.get('chg_pct', 0),
-                            row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma60'), row.get('rsi')
-                        ))
-                    else:
-                        c.execute('''
-                            INSERT OR REPLACE INTO kline_daily 
-                            (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct, ma5, ma10, ma20, ma60, rsi14)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ''', (
-                            symbol, row.get('date'), row.get('open'), row.get('close'),
-                            row.get('high'), row.get('low'), row.get('volume'), row.get('amount', 0),
-                            row.get('chg', 0), row.get('chg_pct', 0),
-                            row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma60'), row.get('rsi')
-                        ))
-                except Exception as e:
-                    logger.error(f"Error saving kline: {e}")
+        for row in kline_data:
+            try:
+                if _is_postgres_target(self.db_path):
+                    self._db.execute('''
+                        INSERT INTO kline_daily 
+                        (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct, ma5, ma10, ma20, ma60, rsi14)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (symbol, trade_date) DO UPDATE SET
+                            open = EXCLUDED.open,
+                            close = EXCLUDED.close,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            volume = EXCLUDED.volume,
+                            amount = EXCLUDED.amount,
+                            chg = EXCLUDED.chg,
+                            chg_pct = EXCLUDED.chg_pct,
+                            ma5 = EXCLUDED.ma5,
+                            ma10 = EXCLUDED.ma10,
+                            ma20 = EXCLUDED.ma20,
+                            ma60 = EXCLUDED.ma60,
+                            rsi14 = EXCLUDED.rsi14
+                    ''', (
+                        symbol, row.get('date'), row.get('open'), row.get('close'),
+                        row.get('high'), row.get('low'), row.get('volume'), row.get('amount', 0),
+                        row.get('chg', 0), row.get('chg_pct', 0),
+                        row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma60'), row.get('rsi')
+                    ))
+                else:
+                    self._db.execute('''
+                        INSERT OR REPLACE INTO kline_daily 
+                        (symbol, trade_date, open, close, high, low, volume, amount, chg, chg_pct, ma5, ma10, ma20, ma60, rsi14)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        symbol, row.get('date'), row.get('open'), row.get('close'),
+                        row.get('high'), row.get('low'), row.get('volume'), row.get('amount', 0),
+                        row.get('chg', 0), row.get('chg_pct', 0),
+                        row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma60'), row.get('rsi')
+                    ))
+            except Exception as e:
+                logger.error(f"Error saving kline: {e}")
         logger.info(f"Saved {len(kline_data)} daily K-line records for {symbol}")
     
     def load_kline_daily(self, symbol: str, limit: int = 365) -> List[dict]:

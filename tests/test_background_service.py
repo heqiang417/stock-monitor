@@ -374,6 +374,8 @@ class TestFeishuNotification:
                 trigger_condition='价格>50'
             )
             background_service.feishu_service.send_stock_alert.assert_called_once()
+            insert_sql = mock_cursor.execute.call_args_list[-1].args[0]
+            assert 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' in insert_sql
             assert result is True
 
     def test_send_notification_success_with_feishu_failure(self, background_service):

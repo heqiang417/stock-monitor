@@ -32,6 +32,7 @@ from sync_health import (
     find_best_trade_date,
     read_sync_status,
 )
+from update_tencent import get_runtime_python
 from db import _is_postgres_target
 
 # 动态加载策略一致性校验（推送前查评估结果）
@@ -496,7 +497,7 @@ def try_repair_before_pick(target_date):
         print(f"[补齐 Step1/2] 同步基础数据: {os.path.basename(UPDATE_TENCENT)}")
         try:
             r = subprocess.run(
-                [sys.executable, UPDATE_TENCENT, '--no-weekly', '--no-monthly'],
+                [get_runtime_python(), UPDATE_TENCENT, '--no-weekly', '--no-monthly'],
                 cwd=SCRIPT_DIR,
                 capture_output=True,
                 text=True,
@@ -534,7 +535,7 @@ def try_repair_before_pick(target_date):
         ]
         print(f"[补齐 Step2/2] 同步扩展数据: {' '.join(extended_flags)}")
         try:
-            cmd = [sys.executable, DAILY_SYNC] + extended_flags
+            cmd = [get_runtime_python(), DAILY_SYNC] + extended_flags
             r = subprocess.run(
                 cmd,
                 cwd=SCRIPT_DIR,
