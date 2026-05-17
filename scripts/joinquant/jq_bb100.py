@@ -31,6 +31,7 @@ def initialize(context):
 
     run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
     run_daily(market_open, time='open', reference_security='000300.XSHG')
+    run_daily(before_close, time='before_close', reference_security='000300.XSHG')
     run_daily(after_market_close, time='after_close', reference_security='000300.XSHG')
 
 
@@ -57,8 +58,11 @@ def before_market_open(context):
 
 
 def market_open(context):
-    sell_stocks(context)
     buy_stocks(context)
+
+
+def before_close(context):
+    sell_stocks(context)
 
 
 def after_market_close(context):
@@ -184,9 +188,14 @@ def buy_stocks(context):
 
     for stock in to_buy:
         order_value(stock, per_stock_cash)
+        current = get_current_data()[stock]
+        buy_price = current.day_open if current.day_open and current.day_open > 0 else current.last_price
+        if buy_price is None or buy_price <= 0:
+            pos = context.portfolio.positions.get(stock)
+            buy_price = pos.avg_cost if pos is not None else 0
         g.hold_info[stock] = {
             'buy_date': context.current_dt.date(),
-            'buy_price': get_current_data()[stock].day_open
+            'buy_price': buy_price
         }
         log.info('买入 {}'.format(stock))
 
@@ -218,16 +227,13 @@ def calc_rsi(series, period=14):
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-
-    if len(avg_gain) == 0 or len(avg_loss) == 0:
-        return np.nan
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
 
     last_gain = avg_gain.iloc[-1]
     last_loss = avg_loss.iloc[-1]
 
-    if pd.isna(last_gain) or pd.isna(last_loss):
+    if np.isnan(last_gain) or np.isnan(last_loss):
         return np.nan
     if last_loss == 0:
         return 100.0
@@ -242,7 +248,7 @@ def calc_boll(series, period=20, num_std=2):
 
     window = series.iloc[-period:]
     middle = window.mean()
-    std = window.std()
+    std = window.std(ddof=0)
     upper = middle + num_std * std
     lower = middle - num_std * std
     return upper, middle, lower
