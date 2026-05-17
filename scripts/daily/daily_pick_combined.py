@@ -32,8 +32,23 @@ from sync_health import (
     find_best_trade_date,
     read_sync_status,
 )
-from update_tencent import get_runtime_python
 from db import _is_postgres_target
+
+def get_runtime_python() -> str:
+    """Prefer configured runtime python when the path exists; otherwise fall back safely."""
+    candidates = [
+        os.environ.get('RUNTIME_PYTHON'),
+        os.path.join(PROJECT_ROOT, '.venv', 'bin', 'python'),
+        sys.executable,
+        '/usr/bin/python3',
+    ]
+    for candidate in candidates:
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return sys.executable or 'python3'
+
 
 # 动态加载策略一致性校验（推送前查评估结果）
 
@@ -487,8 +502,21 @@ def validate(db, date):
     }
 
 
+def get_runtime_env() -> dict:
+    """Return subprocess env with an explicit runtime python and without stale SQLite overrides."""
+    env = os.environ.copy()
+    runtime_python = get_runtime_python()
+    env['RUNTIME_PYTHON'] = runtime_python
+    if REQUIRE_PG:
+        db_env = env.get('POSTGRES_DSN') or env.get('PG_DSN') or env.get('DATABASE_URL') or env.get('DB_DSN')
+        if db_env:
+            env.pop('STOCK_DB', None)
+    return env
+
+
 def try_repair_before_pick(target_date):
     """选股前兜底补齐：先触发基础数据同步，再触发扩展数据同步。"""
+    runtime_env = get_runtime_env()
     repaired_tencent = False
     repaired_extended = False
 
@@ -499,6 +527,7 @@ def try_repair_before_pick(target_date):
             r = subprocess.run(
                 [get_runtime_python(), UPDATE_TENCENT, '--no-weekly', '--no-monthly'],
                 cwd=SCRIPT_DIR,
+                env=runtime_env,
                 capture_output=True,
                 text=True,
                 timeout=60 * 30,
@@ -539,6 +568,7 @@ def try_repair_before_pick(target_date):
             r = subprocess.run(
                 cmd,
                 cwd=SCRIPT_DIR,
+                env=runtime_env,
                 capture_output=True,
                 text=True,
                 timeout=60 * 45,
@@ -867,7 +897,7 @@ result_record = {
             "status": "historical_reference",
             "qualified": bool(STRATEGY_QUALIFIED.get('Fstop3_pt5_v10', False)),
             "metrics": STRATEGY_METRICS.get('Fstop3_pt5_v10', ''),
-            "picks": [{"symbol":p[0],"close":p[1],"rsi":p[2],"bb":p[3],"vol_ratio":round(p[4],2),"fund_score":p[5]} for p in picks_v10],
+            "picks": [],
         }
     },
     "market": {"weak_pct": round(weak_pct, 1), "market_ok_50": market_ok_50, "market_ok_70": market_ok_70}
