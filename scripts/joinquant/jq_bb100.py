@@ -2,7 +2,6 @@
 from jqdata import *
 import pandas as pd
 import numpy as np
-from jqlib.technical_analysis import RSI, BOLL
 
 def initialize(context):
     set_benchmark('000300.XSHG')
@@ -150,14 +149,13 @@ def check_buy_signal(context, stock):
     if bars is None or len(bars) < 25:
         return False
 
-    rsi_dict = RSI(stock, check_date=context.current_dt, N1=14)
-    rsi = rsi_dict.get(stock, np.nan)
+    closes = pd.Series(bars['close'])
+    rsi = calc_rsi(closes, 14)
     if np.isnan(rsi) or rsi >= g.rsi_threshold or rsi < 10:
         return False
 
-    upper, middle, lower = BOLL(stock, check_date=context.current_dt, timeperiod=20, nbdevup=2, nbdevdn=2)
-    bb_lower = lower.get(stock, np.nan)
-    last_close = bars['close'][-1]
+    _, _, bb_lower = calc_boll(closes, 20, 2)
+    last_close = closes.iloc[-1]
 
     if np.isnan(bb_lower):
         return False
@@ -213,3 +211,38 @@ def sell_stocks(context):
             order_target(stock, 0)
             if stock in g.hold_info:
                 del g.hold_info[stock]
+
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    if len(avg_gain) == 0 or len(avg_loss) == 0:
+        return np.nan
+
+    last_gain = avg_gain.iloc[-1]
+    last_loss = avg_loss.iloc[-1]
+
+    if pd.isna(last_gain) or pd.isna(last_loss):
+        return np.nan
+    if last_loss == 0:
+        return 100.0
+
+    rs = last_gain / last_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_boll(series, period=20, num_std=2):
+    if len(series) < period:
+        return np.nan, np.nan, np.nan
+
+    window = series.iloc[-period:]
+    middle = window.mean()
+    std = window.std()
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return upper, middle, lower
