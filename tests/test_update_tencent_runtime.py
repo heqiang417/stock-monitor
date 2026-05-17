@@ -93,7 +93,7 @@ def test_get_runtime_python_skips_missing_runtime_python_env(monkeypatch, tmp_pa
 
 
 def test_get_runtime_python_skips_non_executable_project_venv(monkeypatch, tmp_path):
-    module = _load_update_tencent(monkeypatch, tmp_path)
+    module = _load_update_tencent(monkeypatch, tmp_path, runtime_python='')
     project_root = Path(module.PROJECT_ROOT)
     project_venv_python = project_root / '.venv' / 'bin' / 'python'
     project_venv_python.parent.mkdir(parents=True, exist_ok=True)
@@ -126,7 +126,7 @@ def test_get_runtime_python_skips_non_executable_project_venv(monkeypatch, tmp_p
 
 
 def test_get_runtime_python_prefers_executable_project_venv(monkeypatch, tmp_path):
-    module = _load_update_tencent(monkeypatch, tmp_path)
+    module = _load_update_tencent(monkeypatch, tmp_path, runtime_python='')
     project_root = Path(module.PROJECT_ROOT)
     project_venv_python = project_root / '.venv' / 'bin' / 'python'
     backup_content = None
@@ -139,7 +139,7 @@ def test_get_runtime_python_prefers_executable_project_venv(monkeypatch, tmp_pat
     project_venv_python.write_text('#!/bin/sh\n', encoding='utf-8')
     project_venv_python.chmod(0o755)
     try:
-        module = _load_update_tencent(monkeypatch, tmp_path)
+        module = _load_update_tencent(monkeypatch, tmp_path, runtime_python='')
         assert module.get_runtime_python() == str(project_venv_python)
     finally:
         if existed:
@@ -150,7 +150,7 @@ def test_get_runtime_python_prefers_executable_project_venv(monkeypatch, tmp_pat
 
 
 def test_get_runtime_python_falls_back_when_project_venv_missing(monkeypatch, tmp_path):
-    module = _load_update_tencent(monkeypatch, tmp_path)
+    module = _load_update_tencent(monkeypatch, tmp_path, runtime_python='')
     project_root = Path(module.PROJECT_ROOT)
     project_venv_python = project_root / '.venv' / 'bin' / 'python'
     original_isfile = module.os.path.isfile
@@ -166,6 +166,45 @@ def test_get_runtime_python_falls_back_when_project_venv_missing(monkeypatch, tm
     runtime_python = module.get_runtime_python()
     assert runtime_python == sys.executable or runtime_python == '/usr/bin/python3'
     assert runtime_python != str(project_venv_python)
+
+
+def test_resolve_db_target_prefers_postgres_over_stale_stock_db(monkeypatch, tmp_path):
+    module = _load_update_tencent(monkeypatch, tmp_path)
+
+    resolved = module.resolve_db_target(
+        {
+            'POSTGRES_DSN': 'postgresql://user:***@localhost/db',
+            'STOCK_DB': '/tmp/stale.db',
+        },
+        require_pg=True,
+        default_db_path='/tmp/default.db',
+    )
+
+    assert resolved == 'postgresql://user:***@localhost/db'
+
+
+def test_resolve_db_target_ignores_default_stock_db_override_when_require_pg(monkeypatch, tmp_path):
+    module = _load_update_tencent(monkeypatch, tmp_path)
+
+    resolved = module.resolve_db_target(
+        {'STOCK_DB': '/tmp/default.db'},
+        require_pg=True,
+        default_db_path='/tmp/default.db',
+    )
+
+    assert resolved == '/tmp/default.db'
+
+
+def test_resolve_db_target_falls_back_to_default_when_require_pg_and_no_postgres(monkeypatch, tmp_path):
+    module = _load_update_tencent(monkeypatch, tmp_path)
+
+    resolved = module.resolve_db_target(
+        {'STOCK_DB': '/tmp/stale.db'},
+        require_pg=True,
+        default_db_path='/tmp/default.db',
+    )
+
+    assert resolved == '/tmp/default.db'
 
 
 def test_post_sync_validate_writes_ready_false_when_no_valid_trade_date(monkeypatch, tmp_path):

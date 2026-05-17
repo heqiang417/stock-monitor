@@ -65,9 +65,22 @@ if os.path.exists(env_file):
 from db import _is_postgres_target, _sqlite_placeholders_to_pyformat
 from data_provider.akshare_fetcher import AkshareFetcher
 
+
+def resolve_db_target(environ=None, require_pg=True, default_db_path=None):
+    env = environ or os.environ
+    default_path = default_db_path or DEFAULT_DB_PATH
+    pg_target = env.get('POSTGRES_DSN') or env.get('PG_DSN') or env.get('DATABASE_URL') or env.get('DB_DSN')
+    if pg_target:
+        return pg_target
+    stock_db = env.get('STOCK_DB')
+    if require_pg:
+        return default_path
+    return stock_db or default_path
+
+
 # === 配置 ===
 DEFAULT_DB_PATH = '/home/heqiang/.openclaw/workspace/stock-monitor-app-py/data/stock_data.db'
-DB_TARGET = os.environ.get('POSTGRES_DSN') or os.environ.get('PG_DSN') or os.environ.get('DATABASE_URL') or os.environ.get('DB_DSN') or os.environ.get('STOCK_DB') or DEFAULT_DB_PATH
+DB_TARGET = resolve_db_target(require_pg=False)
 DB_PATH = DB_TARGET
 DB_IS_POSTGRES = _is_postgres_target(DB_TARGET)
 REQUIRE_PG = os.environ.get('REQUIRE_PG', '1') == '1'
@@ -136,7 +149,10 @@ def get_conn():
 
 
 def _q(sql: str) -> str:
-    return _sqlite_placeholders_to_pyformat(sql) if DB_IS_POSTGRES else sql
+    if not DB_IS_POSTGRES:
+        return sql
+    converted = _sqlite_placeholders_to_pyformat(sql)
+    return converted.replace('%%s', '%s')
 
 
 def _exec(conn, sql: str, params=()):
@@ -971,7 +987,7 @@ def _calc_today_bollinger(target_date=None):
 # 同步后数据校验
 # ============================================================
 def _health_exec_factory(conn):
-    return lambda sql, params=None: conn.cursor().execute(sql, params) if False else _exec(conn, sql, params)
+    return lambda sql, params=None: _exec(conn, sql, params)
 
 
 def get_latest_valid_trade_date(conn, min_stocks=MIN_STOCKS, lookback_days=VALID_LOOKBACK_DAYS):
@@ -980,7 +996,7 @@ def get_latest_valid_trade_date(conn, min_stocks=MIN_STOCKS, lookback_days=VALID
         row = _fetchone(_exec(conn, '''
             SELECT trade_date, COUNT(*) AS cnt
             FROM kline_daily
-            WHERE trade_date >= (%s::date - (%s * INTERVAL '1 day'))
+            WHERE trade_date >= (%s::date - (%s || ' day')::interval)
             GROUP BY trade_date
             HAVING COUNT(*) >= %s
             ORDER BY trade_date DESC
