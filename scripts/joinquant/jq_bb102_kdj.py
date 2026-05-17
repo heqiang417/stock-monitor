@@ -31,7 +31,7 @@ def initialize(context):
 
     run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
     run_daily(market_open, time='open', reference_security='000300.XSHG')
-    run_daily(before_close, time='before_close', reference_security='000300.XSHG')
+    run_daily(before_close, time='close', reference_security='000300.XSHG')
     run_daily(after_market_close, time='after_close', reference_security='000300.XSHG')
 
 
