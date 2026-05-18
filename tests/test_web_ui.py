@@ -4,6 +4,7 @@ Run standalone: python3 tests/test_web_ui.py
 Not a pytest test file - uses custom testcase decorator.
 """
 import pytest
+pytest.importorskip("playwright.sync_api")
 pytestmark = pytest.mark.skip(reason="Playwright UI tests - run standalone with: python3 tests/test_web_ui.py")
 
 from playwright.sync_api import sync_playwright

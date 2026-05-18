@@ -2,6 +2,9 @@
 from jqdata import *
 import pandas as pd
 import numpy as np
+from datetime import timedelta
+
+TRADING_DAY_MODE = 'stop_profit'
 
 def initialize(context):
     set_benchmark('000300.XSHG')
@@ -31,6 +34,7 @@ def initialize(context):
 
     g.buy_list = []
     g.hold_info = {}
+    g.sell_check_window = 1
 
     run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
     run_daily(market_open, time='open', reference_security='000300.XSHG')
@@ -194,18 +198,39 @@ def buy_stocks(context):
     if cash <= 0:
         return
 
-    per_stock_cash = cash / len(to_buy)
-
+    current_data = get_current_data()
+    eligible_to_buy = []
     for stock in to_buy:
-        order_value(stock, per_stock_cash)
-        current = get_current_data()[stock]
+        current = current_data.get(stock)
+        if current is None:
+            continue
         buy_price = current.day_open if current.day_open and current.day_open > 0 else current.last_price
         if buy_price is None or buy_price <= 0:
             pos = context.portfolio.positions.get(stock)
             buy_price = pos.avg_cost if pos is not None else 0
+        if buy_price is None or buy_price <= 0:
+            continue
+        if stock.startswith('688'):
+            log.info('跳过 {}，原因: 科创板市价单需保护限价'.format(stock))
+            continue
+        min_lot_cash = buy_price * 100
+        if cash / len(to_buy) < min_lot_cash:
+            log.info('跳过 {}，原因: 单票资金不足100股，需 {:.2f}'.format(stock, min_lot_cash))
+            continue
+        eligible_to_buy.append((stock, buy_price))
+
+    if len(eligible_to_buy) == 0:
+        return
+
+    per_stock_cash = cash / len(eligible_to_buy)
+
+    for stock, buy_price in eligible_to_buy:
+        order_value(stock, per_stock_cash)
         g.hold_info[stock] = {
             'buy_date': context.current_dt.date(),
-            'buy_price': buy_price
+            'buy_price': buy_price,
+            'trading_days': 0,
+            'last_sell_check_date': None,
         }
         log.info('买入 {}'.format(stock))
 
@@ -218,15 +243,23 @@ def sell_stocks(context):
         if pos.closeable_amount <= 0:
             continue
 
-        if stock not in g.hold_info:
-            g.hold_info[stock] = {
+        info = g.hold_info.get(stock)
+        if info is None:
+            info = {
                 'buy_date': context.current_dt.date(),
-                'buy_price': pos.avg_cost
+                'buy_price': pos.avg_cost,
+                'trading_days': 0,
+                'last_sell_check_date': None,
             }
+            g.hold_info[stock] = info
 
-        buy_date = g.hold_info[stock]['buy_date']
-        buy_price = g.hold_info[stock]['buy_price']
-        held_days = (context.current_dt.date() - buy_date).days
+        today = context.current_dt.date()
+        if info.get('last_sell_check_date') != today:
+            info['trading_days'] = info.get('trading_days', 0) + 1
+            info['last_sell_check_date'] = today
+
+        buy_price = info['buy_price']
+        trading_days = info.get('trading_days', 0)
 
         current_price = get_current_data()[stock].last_price
         if current_price is None or current_price <= 0:
@@ -237,7 +270,7 @@ def sell_stocks(context):
         should_sell = False
         reason = ''
 
-        if held_days >= 2:
+        if trading_days >= 2:
             if ret <= -g.stop_loss:
                 should_sell = True
                 reason = '止损'
@@ -245,7 +278,7 @@ def sell_stocks(context):
                 should_sell = True
                 reason = '止盈'
 
-        if (not should_sell) and held_days >= g.hold_days:
+        if (not should_sell) and trading_days > g.hold_days:
             should_sell = True
             reason = '达到最长持有天数'
 

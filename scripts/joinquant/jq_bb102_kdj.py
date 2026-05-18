@@ -2,6 +2,9 @@
 from jqdata import *
 import pandas as pd
 import numpy as np
+from datetime import timedelta
+
+TRADING_DAY_MODE = 'fixed_hold'
 
 def initialize(context):
     set_benchmark('000300.XSHG')
@@ -28,6 +31,7 @@ def initialize(context):
 
     g.buy_list = []
     g.hold_info = {}
+    g.sell_check_window = 1
 
     run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
     run_daily(market_open, time='open', reference_security='000300.XSHG')
@@ -200,7 +204,9 @@ def buy_stocks(context):
             buy_price = pos.avg_cost if pos is not None else 0
         g.hold_info[stock] = {
             'buy_date': context.current_dt.date(),
-            'buy_price': buy_price
+            'buy_price': buy_price,
+            'trading_days': 0,
+            'last_sell_check_date': None,
         }
         log.info('买入 {}'.format(stock))
 
@@ -213,14 +219,23 @@ def sell_stocks(context):
         if pos.closeable_amount <= 0:
             continue
 
-        if stock not in g.hold_info:
-            g.hold_info[stock] = {
+        info = g.hold_info.get(stock)
+        if info is None:
+            info = {
                 'buy_date': context.current_dt.date(),
-                'buy_price': pos.avg_cost
+                'buy_price': pos.avg_cost,
+                'trading_days': 0,
+                'last_sell_check_date': None,
             }
+            g.hold_info[stock] = info
 
-        held_days = (context.current_dt.date() - g.hold_info[stock]['buy_date']).days
-        if held_days >= g.hold_days:
+        last_check_date = info.get('last_sell_check_date')
+        today = context.current_dt.date()
+        if last_check_date != today:
+            info['trading_days'] = info.get('trading_days', 0) + 1
+            info['last_sell_check_date'] = today
+
+        if info.get('trading_days', 0) > g.hold_days:
             log.info('卖出 {}，原因: 固定持有到期'.format(stock))
             order_target(stock, 0)
             if stock in g.hold_info:
